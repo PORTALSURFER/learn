@@ -1,9 +1,12 @@
+pub mod audio;
 pub mod mesh;
 pub mod models;
 pub mod runner;
 pub mod scheduler;
 pub mod service;
 pub mod store;
+
+pub use audio::synthesize_audio_wav;
 
 pub use mesh::{
     DEFAULT_UNSEEN_MU, DEFAULT_UNSEEN_SIGMA, MeshObservation, MeshPropagationResult,

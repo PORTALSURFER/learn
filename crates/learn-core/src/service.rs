@@ -8,8 +8,8 @@ use crate::mesh::{
     MeshObservation, compile_cognitive_slice, propagate_answer_observation, slugify_label,
 };
 use crate::models::{
-    AnswerResult, ClarifyingReply, ConceptEdge, ConceptStatus, DetectedRunner, EdgeKind,
-    KnowledgeMap, RunnerKind, SkillLevel, StoredQuestion, TopicSummary, User,
+    AnswerConfidence, AnswerResult, ClarifyingReply, ConceptEdge, ConceptStatus, DetectedRunner,
+    EdgeKind, KnowledgeMap, RunnerKind, SkillLevel, StoredQuestion, TopicSummary, User,
 };
 use crate::runner::{AiRunner, RunnerConfig};
 use crate::scheduler::{select_next_directive, summarize_stats};
@@ -228,6 +228,8 @@ impl LearnService {
         topic_id: &str,
         question_id: &str,
         selected_choice_id: &str,
+        confidence: AnswerConfidence,
+        used_hint: bool,
     ) -> Result<AnswerResult> {
         let now = now_ms();
         let store = self.store.lock().unwrap();
@@ -284,6 +286,8 @@ impl LearnService {
                 target_concept_id: &question.concept_id,
                 intent: question.intent,
                 is_correct,
+                confidence,
+                used_hint,
                 angle_summary: &question.angle_summary,
                 selected_choice,
                 all_choices: &question.choices,
@@ -523,6 +527,8 @@ impl LearnService {
             concept_id: directive.concept.id,
             intent: directive.intent,
             goal: generated.goal,
+            hint: generated.hint,
+            media: generated.media,
             prompt: generated.prompt,
             choices: generated.choices,
             correct_choice_id: generated.correct_choice_id,
@@ -582,7 +588,16 @@ mod tests {
             .iter()
             .find(|c| c.trap_kind == Some(DistractorTrapKind::Misconception))
             .unwrap();
-        let res1 = svc.submit_answer(&user.id, &topic.id, &q1.id, &mis_choice.id).unwrap();
+        let res1 = svc
+            .submit_answer(
+                &user.id,
+                &topic.id,
+                &q1.id,
+                &mis_choice.id,
+                AnswerConfidence::Confident,
+                false,
+            )
+            .unwrap();
         assert!(!res1.is_correct);
         assert_eq!(res1.concept.status, ConceptStatus::NeedsReview);
         assert!(!res1.mesh_effects.is_empty());
@@ -604,7 +619,14 @@ mod tests {
 
         let q2 = svc.peek_buffered_question(&topic.id).unwrap().unwrap();
         let res2 = svc
-            .submit_answer(&user.id, &topic.id, &q2.id, &q2.correct_choice_id)
+            .submit_answer(
+                &user.id,
+                &topic.id,
+                &q2.id,
+                &q2.correct_choice_id,
+                AnswerConfidence::Guessing,
+                true,
+            )
             .unwrap();
         assert!(res2.is_correct);
         assert_eq!(res2.topic_streak, 1);

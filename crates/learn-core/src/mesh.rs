@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::models::{
-    BridgeBrief, CognitiveSlice, ConceptEdge, ConceptNode, ConceptStatus, ConfusionPairBrief,
-    CrossTopicAnchor, DistractorTrapKind, EdgeKind, FrontierEntry, HypothesisBrief,
-    MisconceptionNode, QuestionChoice, QuestionIntent, TensionSeam,
+    AnswerConfidence, BridgeBrief, CognitiveSlice, ConceptEdge, ConceptNode, ConceptStatus,
+    ConfusionPairBrief, CrossTopicAnchor, DistractorTrapKind, EdgeKind, FrontierEntry,
+    HypothesisBrief, MisconceptionNode, QuestionChoice, QuestionIntent, TensionSeam,
 };
 
 const HOUR_MS: f64 = 3_600_000.0;
@@ -27,6 +27,8 @@ pub struct MeshObservation<'a> {
     pub target_concept_id: &'a str,
     pub intent: QuestionIntent,
     pub is_correct: bool,
+    pub confidence: AnswerConfidence,
+    pub used_hint: bool,
     pub angle_summary: &'a str,
     pub selected_choice: Option<&'a QuestionChoice>,
     pub all_choices: &'a [QuestionChoice],
@@ -105,11 +107,21 @@ pub fn propagate_answer_observation(
         .position(|c| c.id == obs.target_concept_id)
         .expect("target concept must exist in slice");
 
-    let evidence_weight = match obs.intent {
+    let base_evidence_weight = match obs.intent {
         QuestionIntent::DigDeeper => 1.20,
         QuestionIntent::Reinforce => 1.05,
         QuestionIntent::ReviewMistake => 1.00,
         QuestionIntent::Introduce => 0.90,
+    };
+    // Confidence & hint calibration:
+    // - Guessing + correct => modest μ lift, wider σ so we verify unassisted mastery soon
+    // - Hint used + correct => gentler μ lift (scaffolding assisted)
+    // - Confident + wrong => stronger hypercorrection drop & misconception signal
+    let evidence_weight = match (obs.is_correct, obs.confidence, obs.used_hint) {
+        (true, AnswerConfidence::Guessing, _) => base_evidence_weight * 0.50,
+        (true, AnswerConfidence::Confident, true) => base_evidence_weight * 0.72,
+        (false, AnswerConfidence::Confident, false) => base_evidence_weight * 1.15,
+        _ => base_evidence_weight,
     };
 
     // 1. Update target node (μ, σ, S)
@@ -131,8 +143,16 @@ pub fn propagate_answer_observation(
             node.consecutive_correct += 1;
             let raw_mu = prev_mu + gain * (1.0 - prev_mu).max(0.12);
             node.mastery = round3(raw_mu.clamp(0.05, 0.99));
-            // Surprising success on a previously weak node shrinks uncertainty slightly slower
-            let sigma_decay = if prediction_error > 0.55 { 0.78 } else { 0.68 };
+            // Guessing or using a hint keeps uncertainty σ wider so the mesh verifies unassisted recall soon
+            let sigma_decay = if obs.confidence == AnswerConfidence::Guessing {
+                0.90
+            } else if obs.used_hint {
+                0.82
+            } else if prediction_error > 0.55 {
+                0.78
+            } else {
+                0.68
+            };
             node.uncertainty = round3((prev_sigma * sigma_decay).clamp(MIN_SIGMA, MAX_SIGMA));
             node.ease_factor = round3((node.ease_factor + 0.1).min(3.0));
             let next_stability = match node.consecutive_correct {
@@ -696,6 +716,8 @@ mod tests {
                 target_concept_id: "c2",
                 intent: QuestionIntent::Introduce,
                 is_correct: true,
+                confidence: AnswerConfidence::Confident,
+                used_hint: false,
                 angle_summary: "lifetime annotations on structs",
                 selected_choice: None,
                 all_choices: &[],
@@ -739,6 +761,8 @@ mod tests {
                 target_concept_id: "c1",
                 intent: QuestionIntent::Introduce,
                 is_correct: false,
+                confidence: AnswerConfidence::Confident,
+                used_hint: false,
                 angle_summary: "closure trait bounds",
                 selected_choice: Some(&trap_confuse),
                 all_choices: &[trap_confuse.clone(), trap_hyp.clone()],
@@ -757,6 +781,8 @@ mod tests {
                 target_concept_id: "c1",
                 intent: QuestionIntent::ReviewMistake,
                 is_correct: false,
+                confidence: AnswerConfidence::Confident,
+                used_hint: false,
                 angle_summary: "closure execution model",
                 selected_choice: Some(&trap_hyp),
                 all_choices: &[trap_confuse.clone(), trap_hyp.clone()],
@@ -776,6 +802,8 @@ mod tests {
                 target_concept_id: "c1",
                 intent: QuestionIntent::ReviewMistake,
                 is_correct: true,
+                confidence: AnswerConfidence::Confident,
+                used_hint: false,
                 angle_summary: "fresh contrast check",
                 selected_choice: None,
                 all_choices: &[trap_confuse.clone(), trap_hyp.clone()],
@@ -791,6 +819,8 @@ mod tests {
                 target_concept_id: "c1",
                 intent: QuestionIntent::Reinforce,
                 is_correct: true,
+                confidence: AnswerConfidence::Confident,
+                used_hint: false,
                 angle_summary: "second verification",
                 selected_choice: None,
                 all_choices: &[trap_confuse, trap_hyp],

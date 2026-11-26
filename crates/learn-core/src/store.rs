@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::mesh::{DEFAULT_UNSEEN_MU, DEFAULT_UNSEEN_SIGMA, slugify_label};
 use crate::models::{
     ConceptEdge, ConceptInput, ConceptNode, ConceptStatus, CrossTopicAnchor, EdgeKind,
-    MisconceptionNode, QuestionChoice, QuestionIntent, RunnerKind, SkillLevel, StoredQuestion,
-    TopicSummary, User,
+    ExampleMedia, MisconceptionNode, QuestionChoice, QuestionIntent, RunnerKind, SkillLevel,
+    StoredQuestion, TopicSummary, User,
 };
 
 const MAX_MISCONCEPTIONS: usize = 3;
@@ -83,6 +83,8 @@ pub struct CreateQuestionParams {
     pub concept_id: String,
     pub intent: QuestionIntent,
     pub goal: String,
+    pub hint: String,
+    pub media: Option<ExampleMedia>,
     pub prompt: String,
     pub choices: Vec<QuestionChoice>,
     pub correct_choice_id: String,
@@ -203,6 +205,8 @@ impl KnowledgeStore {
                 concept_id TEXT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
                 intent TEXT NOT NULL,
                 goal TEXT NOT NULL DEFAULT '',
+                hint TEXT NOT NULL DEFAULT '',
+                media_json TEXT NOT NULL DEFAULT '',
                 prompt TEXT NOT NULL,
                 choices_json TEXT NOT NULL,
                 correct_choice_id TEXT NOT NULL,
@@ -233,11 +237,17 @@ impl KnowledgeStore {
         let _ = self
             .conn
             .execute("ALTER TABLE questions ADD COLUMN goal TEXT NOT NULL DEFAULT ''", []);
-        // Clear legacy unanswered buffered questions created before `goal` / `whyWrong` prompts existed
+        let _ = self
+            .conn
+            .execute("ALTER TABLE questions ADD COLUMN hint TEXT NOT NULL DEFAULT ''", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE questions ADD COLUMN media_json TEXT NOT NULL DEFAULT ''", []);
+        // Clear legacy unanswered buffered questions created before `goal` / `hint` prompts existed
         // so users immediately receive the upgraded question format after updating.
         let _ = self
             .conn
-            .execute("DELETE FROM questions WHERE answered_at IS NULL AND goal = ''", []);
+            .execute("DELETE FROM questions WHERE answered_at IS NULL AND (goal = '' OR hint = '')", []);
         // Normalize legacy unseen rows (mastery=0.0, attempts=0) to the neutral Bayesian prior (0.50, σ=0.90)
         let _ = self.conn.execute(
             "UPDATE concepts SET mastery = ?1, uncertainty = ?2 WHERE attempts = 0 AND mastery = 0.0",
@@ -906,12 +916,16 @@ impl KnowledgeStore {
         let id = Uuid::new_v4().to_string();
         let now = now_ms();
         let angle: String = input.angle_summary.trim().chars().take(MAX_ANGLE_CHARS).collect();
+        let media_json = match &input.media {
+            Some(m) => serde_json::to_string(m)?,
+            None => String::new(),
+        };
         self.conn.execute(
             r#"
             INSERT INTO questions (
-                id, topic_id, concept_id, intent, goal, prompt, choices_json,
+                id, topic_id, concept_id, intent, goal, hint, media_json, prompt, choices_json,
                 correct_choice_id, explanation, angle_summary, source, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             "#,
             params![
                 id,
@@ -919,6 +933,8 @@ impl KnowledgeStore {
                 input.concept_id,
                 input.intent.as_str(),
                 input.goal.trim(),
+                input.hint.trim(),
+                media_json,
                 input.prompt.trim(),
                 serde_json::to_string(&input.choices)?,
                 input.correct_choice_id,
@@ -937,9 +953,9 @@ impl KnowledgeStore {
             .query_row(
                 r#"
                 SELECT q.id, q.topic_id, q.concept_id, c.title, c.subtopic, c.depth,
-                       q.intent, q.goal, q.prompt, q.choices_json, q.correct_choice_id,
-                       q.explanation, q.angle_summary, q.source, q.created_at,
-                       q.answered_at, q.selected_choice_id, q.is_correct
+                       q.intent, q.goal, q.hint, q.media_json, q.prompt, q.choices_json,
+                       q.correct_choice_id, q.explanation, q.angle_summary, q.source,
+                       q.created_at, q.answered_at, q.selected_choice_id, q.is_correct
                 FROM questions q
                 JOIN concepts c ON c.id = q.concept_id
                 WHERE q.id = ?1
@@ -956,9 +972,9 @@ impl KnowledgeStore {
             .query_row(
                 r#"
                 SELECT q.id, q.topic_id, q.concept_id, c.title, c.subtopic, c.depth,
-                       q.intent, q.goal, q.prompt, q.choices_json, q.correct_choice_id,
-                       q.explanation, q.angle_summary, q.source, q.created_at,
-                       q.answered_at, q.selected_choice_id, q.is_correct
+                       q.intent, q.goal, q.hint, q.media_json, q.prompt, q.choices_json,
+                       q.correct_choice_id, q.explanation, q.angle_summary, q.source,
+                       q.created_at, q.answered_at, q.selected_choice_id, q.is_correct
                 FROM questions q
                 JOIN concepts c ON c.id = q.concept_id
                 WHERE q.topic_id = ?1 AND q.answered_at IS NULL
@@ -1073,9 +1089,15 @@ impl KnowledgeStore {
 
     fn map_question(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredQuestion> {
         let intent_str: String = row.get(6)?;
-        let choices_json: String = row.get(9)?;
-        let source_str: String = row.get(13)?;
-        let is_correct_int: Option<i64> = row.get(17)?;
+        let media_json: String = row.get(9)?;
+        let choices_json: String = row.get(11)?;
+        let source_str: String = row.get(15)?;
+        let is_correct_int: Option<i64> = row.get(19)?;
+        let media = if media_json.trim().is_empty() {
+            None
+        } else {
+            serde_json::from_str::<ExampleMedia>(&media_json).ok()
+        };
         Ok(StoredQuestion {
             id: row.get(0)?,
             topic_id: row.get(1)?,
@@ -1085,15 +1107,17 @@ impl KnowledgeStore {
             depth: row.get(5)?,
             intent: QuestionIntent::from_str(&intent_str),
             goal: row.get(7)?,
-            prompt: row.get(8)?,
+            hint: row.get(8)?,
+            media,
+            prompt: row.get(10)?,
             choices: serde_json::from_str(&choices_json).unwrap_or_default(),
-            correct_choice_id: row.get(10)?,
-            explanation: row.get(11)?,
-            angle_summary: row.get(12)?,
+            correct_choice_id: row.get(12)?,
+            explanation: row.get(13)?,
+            angle_summary: row.get(14)?,
             source: RunnerKind::from_str(&source_str),
-            created_at: row.get(14)?,
-            answered_at: row.get(15)?,
-            selected_choice_id: row.get(16)?,
+            created_at: row.get(16)?,
+            answered_at: row.get(17)?,
+            selected_choice_id: row.get(18)?,
             is_correct: is_correct_int.map(|v| v == 1),
         })
     }
@@ -1156,6 +1180,8 @@ mod tests {
                     concept_id: bc.id.clone(),
                     intent: QuestionIntent::Introduce,
                     goal: "Understand why Rust tracks borrows.".into(),
+                    hint: "Think about simultaneous writers.".into(),
+                    media: None,
                     prompt: format!("Q {i}?"),
                     choices: vec![
                         QuestionChoice { id: "A".into(), text: "1".into(), trap_kind: None, trap_target: None, why_wrong: None },

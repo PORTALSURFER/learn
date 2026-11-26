@@ -1,11 +1,14 @@
+use std::process::{Child, Command};
+
 use gpui::{
     AnyElement, AsyncApp, ClickEvent, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent,
     SharedString, WeakEntity, Window, div, prelude::*, px,
 };
 use learn_core::{
-    AnswerResult, ClarifyingReply, ConceptNode, ConceptStatus, DEFAULT_BUFFER_TARGET,
-    DEFAULT_OPEN_QUEUE_TARGET, DetectedRunner, EdgeKind, KnowledgeMap, LearnService,
-    QuestionIntent, RunnerKind, SkillLevel, StoredQuestion, TopicSummary, User,
+    AnswerConfidence, AnswerResult, AudioDemoSpec, ClarifyingReply, ConceptNode, ConceptStatus,
+    DEFAULT_BUFFER_TARGET, DEFAULT_OPEN_QUEUE_TARGET, DetectedRunner, EdgeKind, ExampleMedia,
+    KnowledgeMap, LearnService, MediaReveal, QuestionIntent, RunnerKind, SkillLevel,
+    StoredQuestion, TopicSummary, User, synthesize_audio_wav,
 };
 
 use crate::text_buffer::TextBuffer;
@@ -55,7 +58,13 @@ pub struct LearnApp {
     active_topic_id: Option<String>,
     knowledge_map: Option<KnowledgeMap>,
     current_question: Option<StoredQuestion>,
+    selected_choice_id: Option<String>,
+    hint_revealed: bool,
     last_answer: Option<AnswerResult>,
+
+    // Audio preview playback
+    audio_child: Option<Child>,
+    audio_status: Option<String>,
 
     // Live UI feedback
     busy_message: Option<String>,
@@ -103,7 +112,11 @@ impl LearnApp {
             active_topic_id: None,
             knowledge_map: None,
             current_question: None,
+            selected_choice_id: None,
+            hint_revealed: false,
             last_answer: None,
+            audio_child: None,
+            audio_status: None,
             busy_message: None,
             prefetching: false,
             prefetch_topic_id: None,
@@ -158,7 +171,10 @@ impl LearnApp {
         self.active_topic_id = None;
         self.knowledge_map = None;
         self.current_question = None;
+        self.selected_choice_id = None;
+        self.hint_revealed = false;
         self.last_answer = None;
+        self.stop_audio_quiet();
         self.busy_message = None;
         self.prefetching = false;
         self.prefetch_topic_id = None;
@@ -246,7 +262,10 @@ impl LearnApp {
                         view.active_topic_id = Some(topic.id.clone());
                         view.knowledge_map = Some(map);
                         view.current_question = Some(question);
+                        view.selected_choice_id = None;
+                        view.hint_revealed = false;
                         view.last_answer = None;
+                        view.stop_audio_quiet();
                         view.route = Route::Quiz;
                         view.active_field = ActiveField::None;
                         view.refresh_topics();
@@ -271,7 +290,10 @@ impl LearnApp {
         self.active_topic_id = Some(topic_id.clone());
         self.route = Route::Quiz;
         self.active_field = ActiveField::None;
+        self.selected_choice_id = None;
+        self.hint_revealed = false;
         self.last_answer = None;
+        self.stop_audio_quiet();
         self.clarify_input.clear();
         self.clarify_busy = false;
         self.clarify_replies.clear();
@@ -347,26 +369,104 @@ impl LearnApp {
         cx.notify();
     }
 
-    fn select_answer(&mut self, choice_id: &str, cx: &mut Context<Self>) {
+    fn pick_choice(&mut self, choice_id: &str, cx: &mut Context<Self>) {
         if self.last_answer.is_some() || self.busy_message.is_some() {
             return;
         }
+        self.selected_choice_id = Some(choice_id.to_string());
+        self.error_banner = None;
+        cx.notify();
+    }
+
+    fn submit_selected_answer(&mut self, confidence: AnswerConfidence, cx: &mut Context<Self>) {
+        if self.last_answer.is_some() || self.busy_message.is_some() {
+            return;
+        }
+        let Some(choice_id) = self.selected_choice_id.clone() else {
+            self.error_banner = Some("Pick an option (A–D) first, then submit as Guess or Sure!".into());
+            cx.notify();
+            return;
+        };
         let Some(user) = self.user.clone() else { return };
         let Some(topic_id) = self.active_topic_id.clone() else { return };
         let Some(question) = self.current_question.clone() else { return };
 
-        match self
-            .service
-            .submit_answer(&user.id, &topic_id, &question.id, choice_id)
-        {
+        match self.service.submit_answer(
+            &user.id,
+            &topic_id,
+            &question.id,
+            &choice_id,
+            confidence,
+            self.hint_revealed,
+        ) {
             Ok(result) => {
                 self.last_answer = Some(result);
+                self.error_banner = None;
                 self.refresh_topics();
                 self.trigger_background_prefetch(cx);
             }
             Err(err) => {
                 self.error_banner = Some(err.to_string());
             }
+        }
+        cx.notify();
+    }
+
+    fn stop_audio_quiet(&mut self) {
+        if let Some(mut child) = self.audio_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.audio_status = None;
+    }
+
+    fn play_audio_demo(
+        &mut self,
+        spec: AudioDemoSpec,
+        dry_before: bool,
+        label: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.stop_audio_quiet();
+        let tag = if dry_before { "before" } else { "after" };
+        let wav_path = std::env::temp_dir().join(format!("learn-demo-{tag}.wav"));
+        match synthesize_audio_wav(&spec, dry_before, &wav_path) {
+            Ok(path) => match Command::new("afplay").arg(&path).spawn() {
+                Ok(child) => {
+                    self.audio_child = Some(child);
+                    self.audio_status = Some(format!("Playing: {label}"));
+                    self.error_banner = None;
+                }
+                Err(err) => {
+                    self.error_banner = Some(format!("Audio playback unavailable (`afplay`): {err}"));
+                }
+            },
+            Err(err) => {
+                self.error_banner = Some(format!("Failed to synthesize audio preview: {err}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn launch_interactive_html(&mut self, question_id: &str, html: &str, cx: &mut Context<Self>) {
+        let dir = std::env::var("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(".learn-iocore").join("labs"))
+            .unwrap_or_else(|_| std::env::temp_dir().join("learn-labs"));
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            self.error_banner = Some(format!("Could not create labs directory: {err}"));
+            cx.notify();
+            return;
+        }
+        let path = dir.join(format!("{question_id}.html"));
+        if let Err(err) = std::fs::write(&path, html) {
+            self.error_banner = Some(format!("Could not write interactive lab: {err}"));
+            cx.notify();
+            return;
+        }
+        if let Err(err) = Command::new("open").arg(&path).spawn() {
+            self.error_banner = Some(format!("Could not open interactive lab: {err}"));
+        } else {
+            self.info_banner = Some("Opened interactive lab in your default browser.".into());
         }
         cx.notify();
     }
@@ -779,19 +879,36 @@ impl LearnApp {
             if self.last_answer.is_none() {
                 match ks.key.as_str() {
                     "1" | "a" => {
-                        self.select_answer("A", cx);
+                        self.pick_choice("A", cx);
                         return;
                     }
                     "2" | "b" => {
-                        self.select_answer("B", cx);
+                        self.pick_choice("B", cx);
                         return;
                     }
                     "3" | "c" => {
-                        self.select_answer("C", cx);
+                        self.pick_choice("C", cx);
                         return;
                     }
                     "4" | "d" => {
-                        self.select_answer("D", cx);
+                        self.pick_choice("D", cx);
+                        return;
+                    }
+                    "h" => {
+                        self.hint_revealed = true;
+                        cx.notify();
+                        return;
+                    }
+                    "g" => {
+                        if self.selected_choice_id.is_some() {
+                            self.submit_selected_answer(AnswerConfidence::Guessing, cx);
+                        }
+                        return;
+                    }
+                    "enter" => {
+                        if self.selected_choice_id.is_some() {
+                            self.submit_selected_answer(AnswerConfidence::Confident, cx);
+                        }
                         return;
                     }
                     _ => {}
@@ -1873,6 +1990,457 @@ impl LearnApp {
         container.child(topics_section)
     }
 
+    fn render_example_media(
+        &self,
+        media: &ExampleMedia,
+        question_id: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match media {
+            ExampleMedia::Curve {
+                title,
+                caption,
+                values,
+                labels,
+                ..
+            } => {
+                let mut bars = div()
+                    .w_full()
+                    .h(px(76.0))
+                    .flex()
+                    .items_end()
+                    .gap_1p5()
+                    .pt_2();
+                for (i, val) in values.iter().enumerate() {
+                    let v = val.clamp(0.06, 1.0);
+                    let lbl = labels.get(i).cloned().unwrap_or_default();
+                    bars = bars.child(
+                        div()
+                            .flex_1()
+                            .min_w(px(10.0))
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .justify_end()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(54.0 * v))
+                                    .rounded_t_sm()
+                                    .bg(if v >= 0.72 {
+                                        theme::emerald()
+                                    } else {
+                                        theme::accent()
+                                    }),
+                            )
+                            .when(!lbl.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::text_muted())
+                                        .child(lbl),
+                                )
+                            }),
+                    );
+                }
+
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .p_4()
+                    .rounded_lg()
+                    .bg(theme::bg_input())
+                    .border_1()
+                    .border_color(theme::border_subtle())
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::sky_text())
+                            .child(format!("Visual · {title}")),
+                    )
+                    .child(bars)
+                    .when(!caption.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(theme::text_secondary())
+                                .child(caption.clone()),
+                        )
+                    })
+                    .into_any_element()
+            }
+            ExampleMedia::Flow {
+                title,
+                caption,
+                steps,
+                ..
+            } => {
+                let mut row = div().w_full().min_w_0().flex().flex_wrap().items_center().gap_2();
+                for (idx, step) in steps.iter().enumerate() {
+                    if idx > 0 {
+                        row = row.child(
+                            div()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(theme::accent_text())
+                                .child("→"),
+                        );
+                    }
+                    row = row.child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(theme::bg_card())
+                            .border_1()
+                            .border_color(theme::border_subtle())
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_primary())
+                                    .child(step.label.clone()),
+                            )
+                            .when(!step.note.trim().is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::text_muted())
+                                        .child(step.note.clone()),
+                                )
+                            }),
+                    );
+                }
+
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .p_4()
+                    .rounded_lg()
+                    .bg(theme::bg_input())
+                    .border_1()
+                    .border_color(theme::border_subtle())
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::sky_text())
+                            .child(format!("Diagram · {title}")),
+                    )
+                    .child(row)
+                    .when(!caption.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(theme::text_secondary())
+                                .child(caption.clone()),
+                        )
+                    })
+                    .into_any_element()
+            }
+            ExampleMedia::Contrast {
+                title,
+                caption,
+                left_title,
+                left_points,
+                right_title,
+                right_points,
+                ..
+            } => {
+                let make_col = |heading: &str, pts: &[String], accent_fg: gpui::Rgba| {
+                    let mut col = div()
+                        .flex_1()
+                        .min_w(px(220.0))
+                        .p_3()
+                        .rounded_md()
+                        .bg(theme::bg_card())
+                        .border_1()
+                        .border_color(theme::border_subtle())
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(accent_fg)
+                                .child(heading.to_string()),
+                        );
+                    for p in pts {
+                        col = col.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(theme::text_secondary())
+                                .child(format!("• {p}")),
+                        );
+                    }
+                    col
+                };
+
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .p_4()
+                    .rounded_lg()
+                    .bg(theme::bg_input())
+                    .border_1()
+                    .border_color(theme::border_subtle())
+                    .flex()
+                    .flex_col()
+                    .gap_2p5()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::sky_text())
+                            .child(format!("Contrast · {title}")),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .flex_wrap()
+                            .gap_3()
+                            .child(make_col(left_title, left_points, theme::amber_text()))
+                            .child(make_col(right_title, right_points, theme::emerald_text())),
+                    )
+                    .when(!caption.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(theme::text_secondary())
+                                .child(caption.clone()),
+                        )
+                    })
+                    .into_any_element()
+            }
+            ExampleMedia::Audio {
+                title,
+                caption,
+                spec,
+                ..
+            } => {
+                let spec_before = spec.clone();
+                let spec_after = spec.clone();
+                let before_lbl = spec
+                    .before_label
+                    .clone()
+                    .unwrap_or_else(|| "Before (Flat / Dry)".into());
+                let after_lbl = spec
+                    .after_label
+                    .clone()
+                    .unwrap_or_else(|| "After (Target Effect)".into());
+                let b_status = before_lbl.clone();
+                let a_status = after_lbl.clone();
+
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .p_4()
+                    .rounded_lg()
+                    .bg(theme::bg_input())
+                    .border_1()
+                    .border_color(theme::accent())
+                    .flex()
+                    .flex_col()
+                    .gap_2p5()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme::accent_text())
+                                    .child(format!("Audio Example · {title}")),
+                            )
+                            .when_some(self.audio_status.clone(), |el, st| {
+                                el.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::emerald_text())
+                                        .child(st),
+                                )
+                            }),
+                    )
+                    .when(!caption.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(theme::text_secondary())
+                                .child(caption.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("btn-audio-before")
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .bg(theme::bg_card())
+                                    .border_1()
+                                    .border_color(theme::border_subtle())
+                                    .hover(|s| s.border_color(theme::accent()))
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(theme::text_primary())
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.play_audio_demo(
+                                            spec_before.clone(),
+                                            true,
+                                            b_status.clone(),
+                                            cx,
+                                        );
+                                    }))
+                                    .child(format!("▶ {before_lbl}")),
+                            )
+                            .child(
+                                div()
+                                    .id("btn-audio-after")
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .bg(theme::accent())
+                                    .hover(|s| s.bg(theme::accent_hover()))
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme::pure_white())
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.play_audio_demo(
+                                            spec_after.clone(),
+                                            false,
+                                            a_status.clone(),
+                                            cx,
+                                        );
+                                    }))
+                                    .child(format!("▶ {after_lbl}")),
+                            )
+                            .when(self.audio_child.is_some(), |el| {
+                                el.child(
+                                    div()
+                                        .id("btn-audio-stop")
+                                        .px_3()
+                                        .py_1p5()
+                                        .rounded_md()
+                                        .bg(theme::rose_soft())
+                                        .border_1()
+                                        .border_color(theme::rose())
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .text_color(theme::rose_text())
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.stop_audio_quiet();
+                                            cx.notify();
+                                        }))
+                                        .child("■ Stop"),
+                                )
+                            }),
+                    )
+                    .into_any_element()
+            }
+            ExampleMedia::InteractiveHtml {
+                title,
+                caption,
+                html,
+                ..
+            } => {
+                let qid = question_id.to_string();
+                let html_src = html.clone();
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .p_4()
+                    .rounded_lg()
+                    .bg(theme::bg_input())
+                    .border_1()
+                    .border_color(theme::accent())
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(220.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme::accent_text())
+                                    .child(format!("Interactive Lab · {title}")),
+                            )
+                            .when(!caption.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .text_color(theme::text_secondary())
+                                        .child(caption.clone()),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("btn-open-html-lab")
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(theme::accent())
+                            .hover(|s| s.bg(theme::accent_hover()))
+                            .cursor_pointer()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::pure_white())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.launch_interactive_html(&qid, &html_src, cx);
+                            }))
+                            .child("↗ Launch Interactive Example"),
+                    )
+                    .into_any_element()
+            }
+        }
+    }
+
     // ---------- Screen 3: Live Quiz Arena ----------
 
     fn render_quiz(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2163,9 +2731,36 @@ impl LearnApp {
                     .child(q.prompt.clone()),
             );
 
+        // Render AI-chosen media inline above choices if reveal == BeforeAnswer
+        if let Some(media) = &q.media {
+            if media.reveal() == MediaReveal::BeforeAnswer {
+                q_card = q_card.child(self.render_example_media(media, &q.id, cx));
+            }
+        }
+
+        // Revealed Hint banner
+        if self.hint_revealed && !q.hint.trim().is_empty() && self.last_answer.is_none() {
+            q_card = q_card.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .px_3p5()
+                    .py_2p5()
+                    .rounded_md()
+                    .bg(theme::amber_soft())
+                    .border_1()
+                    .border_color(theme::amber())
+                    .text_xs()
+                    .line_height(px(18.0))
+                    .text_color(theme::amber_text())
+                    .child(format!("Hint: {}", q.hint)),
+            );
+        }
+
         let mut choices_col = div().w_full().min_w_0().flex().flex_col().gap_2p5();
         for (idx, choice) in q.choices.iter().enumerate() {
             let cid = choice.id.clone();
+            let is_picked = self.selected_choice_id.as_deref() == Some(choice.id.as_str());
             let (bg, border, badge_bg, badge_fg) = if let Some(ans) = &self.last_answer {
                 if choice.id == ans.correct_choice_id {
                     (theme::emerald_soft(), theme::emerald(), theme::emerald(), theme::pure_white())
@@ -2174,6 +2769,8 @@ impl LearnApp {
                 } else {
                     (theme::bg_input(), theme::border_subtle(), theme::bg_card(), theme::text_muted())
                 }
+            } else if is_picked {
+                (theme::accent_soft(), theme::accent(), theme::accent(), theme::pure_white())
             } else {
                 (theme::bg_input(), theme::border_subtle(), theme::accent_soft(), theme::accent_text())
             };
@@ -2197,7 +2794,7 @@ impl LearnApp {
                     .items_start()
                     .gap_3()
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.select_answer(&cid, cx);
+                        this.pick_choice(&cid, cx);
                     }))
                     .child(
                         div()
@@ -2229,13 +2826,136 @@ impl LearnApp {
         q_card = q_card.child(choices_col);
 
         if self.last_answer.is_none() {
+            let has_pick = self.selected_choice_id.is_some();
+            let has_hint = !q.hint.trim().is_empty() && !self.hint_revealed;
+
             q_card = q_card.child(
                 div()
                     .w_full()
                     .min_w_0()
-                    .text_xs()
-                    .text_color(theme::text_muted())
-                    .child("Tip: click an option or press keys 1–4 (or A–D) to answer"),
+                    .pt_1()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_2()
+                            .when(has_hint, |el| {
+                                el.child(
+                                    div()
+                                        .id("btn-show-hint")
+                                        .px_3()
+                                        .py_1p5()
+                                        .rounded_md()
+                                        .bg(theme::bg_input())
+                                        .border_1()
+                                        .border_color(theme::border_subtle())
+                                        .hover(|s| s.border_color(theme::amber()))
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .text_color(theme::amber_text())
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.hint_revealed = true;
+                                            cx.notify();
+                                        }))
+                                        .child("Show Hint (H)"),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::text_muted())
+                                    .child(if has_pick {
+                                        "Submit as Guess (G) or Sure (Enter)"
+                                    } else {
+                                        "Pick A–D (or keys 1–4), then submit as Guess or Sure"
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("btn-submit-guess")
+                                    .px_4()
+                                    .py_2()
+                                    .rounded_md()
+                                    .bg(if has_pick {
+                                        theme::amber_soft()
+                                    } else {
+                                        theme::bg_input()
+                                    })
+                                    .border_1()
+                                    .border_color(if has_pick {
+                                        theme::amber()
+                                    } else {
+                                        theme::border_subtle()
+                                    })
+                                    .when(has_pick, |el| el.cursor_pointer())
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(if has_pick {
+                                        theme::amber_text()
+                                    } else {
+                                        theme::text_muted()
+                                    })
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        if this.selected_choice_id.is_some() {
+                                            this.submit_selected_answer(
+                                                AnswerConfidence::Guessing,
+                                                cx,
+                                            );
+                                        }
+                                    }))
+                                    .child("Submit · Guess (G)"),
+                            )
+                            .child(
+                                div()
+                                    .id("btn-submit-sure")
+                                    .px_4()
+                                    .py_2()
+                                    .rounded_md()
+                                    .bg(if has_pick {
+                                        theme::accent()
+                                    } else {
+                                        theme::bg_input()
+                                    })
+                                    .when(has_pick, |el| {
+                                        el.hover(|s| s.bg(theme::accent_hover())).cursor_pointer()
+                                    })
+                                    .border_1()
+                                    .border_color(if has_pick {
+                                        theme::accent()
+                                    } else {
+                                        theme::border_subtle()
+                                    })
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(if has_pick {
+                                        theme::pure_white()
+                                    } else {
+                                        theme::text_muted()
+                                    })
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        if this.selected_choice_id.is_some() {
+                                            this.submit_selected_answer(
+                                                AnswerConfidence::Confident,
+                                                cx,
+                                            );
+                                        }
+                                    }))
+                                    .child("Submit · Sure! (Enter)"),
+                            ),
+                    ),
             );
         }
 
@@ -2340,6 +3060,13 @@ impl LearnApp {
                         .text_color(theme::text_primary())
                         .child(ans.explanation.clone()),
                 );
+
+            // Render AI-chosen media inside feedback if reveal == AfterAnswer
+            if let Some(media) = &q.media {
+                if media.reveal() == MediaReveal::AfterAnswer {
+                    fb = fb.child(self.render_example_media(media, &q.id, cx));
+                }
+            }
 
             if !ans.mesh_effects.is_empty() {
                 let mut effects_box = div()

@@ -330,6 +330,138 @@ pub struct QuestionChoice {
     pub why_wrong: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaReveal {
+    BeforeAnswer,
+    AfterAnswer,
+}
+
+impl Default for MediaReveal {
+    fn default() -> Self {
+        MediaReveal::BeforeAnswer
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowStep {
+    pub label: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// Declarative audio demo parameters synthesized in pure Rust to a temporary WAV file.
+/// Supports melodic/synth motifs, low-pass filter sweeps, kick/hat groove, accent, and microtiming.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioDemoSpec {
+    #[serde(default = "default_bpm")]
+    pub bpm: f32,
+    #[serde(default = "default_base_hz")]
+    pub base_hz: f32,
+    /// Optional low-pass filter cutoff start -> end (Hz) for timbre/sweep examples.
+    #[serde(default = "default_cutoff_start")]
+    pub cutoff_start_hz: f32,
+    #[serde(default = "default_cutoff_end")]
+    pub cutoff_end_hz: f32,
+    /// Optional 1-based step (1..=16) to accent/nudge in rhythmic examples.
+    #[serde(default)]
+    pub accent_step: Option<u8>,
+    /// Microtiming nudge in milliseconds on the accented step (positive = laid-back/later, negative = rushed/earlier).
+    #[serde(default)]
+    pub nudge_ms: f32,
+    /// Include steady 4-on-the-floor kick & closed hats when demonstrating groove/techno.
+    #[serde(default)]
+    pub include_drums: bool,
+    /// Optional label for a contrasting "Before / Dry" version so users can A/B compare.
+    #[serde(default)]
+    pub before_label: Option<String>,
+    #[serde(default)]
+    pub after_label: Option<String>,
+}
+
+fn default_bpm() -> f32 {
+    128.0
+}
+fn default_base_hz() -> f32 {
+    110.0
+}
+fn default_cutoff_start() -> f32 {
+    350.0
+}
+fn default_cutoff_end() -> f32 {
+    3200.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExampleMedia {
+    Curve {
+        title: String,
+        caption: String,
+        #[serde(default)]
+        reveal: MediaReveal,
+        values: Vec<f32>,
+        #[serde(default)]
+        labels: Vec<String>,
+    },
+    Flow {
+        title: String,
+        caption: String,
+        #[serde(default)]
+        reveal: MediaReveal,
+        steps: Vec<FlowStep>,
+    },
+    Contrast {
+        title: String,
+        caption: String,
+        #[serde(default)]
+        reveal: MediaReveal,
+        left_title: String,
+        left_points: Vec<String>,
+        right_title: String,
+        right_points: Vec<String>,
+    },
+    Audio {
+        title: String,
+        caption: String,
+        #[serde(default)]
+        reveal: MediaReveal,
+        spec: AudioDemoSpec,
+    },
+    InteractiveHtml {
+        title: String,
+        caption: String,
+        #[serde(default)]
+        reveal: MediaReveal,
+        html: String,
+    },
+}
+
+impl ExampleMedia {
+    pub fn reveal(&self) -> MediaReveal {
+        match self {
+            ExampleMedia::Curve { reveal, .. }
+            | ExampleMedia::Flow { reveal, .. }
+            | ExampleMedia::Contrast { reveal, .. }
+            | ExampleMedia::Audio { reveal, .. }
+            | ExampleMedia::InteractiveHtml { reveal, .. } => *reveal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerConfidence {
+    Guessing,
+    Confident,
+}
+
+impl Default for AnswerConfidence {
+    fn default() -> Self {
+        AnswerConfidence::Confident
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredQuestion {
     pub id: String,
@@ -342,6 +474,12 @@ pub struct StoredQuestion {
     /// Plain-English framing of the goal/purpose before the question prompt.
     #[serde(default)]
     pub goal: String,
+    /// Pre-generated 1-sentence hint revealed on demand (`H`) without spoiling the answer.
+    #[serde(default)]
+    pub hint: String,
+    /// Optional AI-chosen visual, audible, or interactive example matched to this specific question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<ExampleMedia>,
     pub prompt: String,
     pub choices: Vec<QuestionChoice>,
     pub correct_choice_id: String,

@@ -14,6 +14,7 @@ impl TextBuffer {
         Self::default()
     }
 
+    #[cfg(test)]
     pub fn from_string(text: String) -> Self {
         let end = text.len();
         Self {

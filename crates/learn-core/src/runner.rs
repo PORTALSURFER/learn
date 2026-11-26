@@ -9,13 +9,15 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::models::{
-    ConceptInput, DetectedRunner, DistractorTrapKind, QuestionChoice, QuestionIntent, RunnerKind,
-    SchedulerDirective, SkillLevel,
+    AudioDemoSpec, ConceptInput, DetectedRunner, DistractorTrapKind, ExampleMedia, FlowStep,
+    MediaReveal, QuestionChoice, QuestionIntent, RunnerKind, SchedulerDirective, SkillLevel,
 };
 
 #[derive(Debug, Clone)]
 pub struct GeneratedQuestion {
     pub goal: String,
+    pub hint: String,
+    pub media: Option<ExampleMedia>,
     pub prompt: String,
     pub choices: Vec<QuestionChoice>,
     pub correct_choice_id: String,
@@ -115,9 +117,62 @@ pub fn question_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["goal", "prompt", "correctAnswer", "distractors", "explanation", "angleSummary"],
+        "required": ["goal", "hint", "media", "prompt", "correctAnswer", "distractors", "explanation", "angleSummary"],
         "properties": {
             "goal": { "type": "string" },
+            "hint": { "type": "string" },
+            "media": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "kind", "reveal", "title", "caption",
+                    "values", "labels", "flowSteps",
+                    "leftTitle", "leftPoints", "rightTitle", "rightPoints",
+                    "bpm", "baseHz", "cutoffStartHz", "cutoffEndHz",
+                    "accentStep", "nudgeMs", "includeDrums",
+                    "beforeLabel", "afterLabel", "html"
+                ],
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["none", "curve", "flow", "contrast", "audio", "interactive_html"]
+                    },
+                    "reveal": {
+                        "type": "string",
+                        "enum": ["before_answer", "after_answer"]
+                    },
+                    "title": { "type": "string" },
+                    "caption": { "type": "string" },
+                    "values": { "type": "array", "items": { "type": "number" } },
+                    "labels": { "type": "array", "items": { "type": "string" } },
+                    "flowSteps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["label", "note"],
+                            "properties": {
+                                "label": { "type": "string" },
+                                "note": { "type": "string" }
+                            }
+                        }
+                    },
+                    "leftTitle": { "type": "string" },
+                    "leftPoints": { "type": "array", "items": { "type": "string" } },
+                    "rightTitle": { "type": "string" },
+                    "rightPoints": { "type": "array", "items": { "type": "string" } },
+                    "bpm": { "type": "number" },
+                    "baseHz": { "type": "number" },
+                    "cutoffStartHz": { "type": "number" },
+                    "cutoffEndHz": { "type": "number" },
+                    "accentStep": { "type": "integer" },
+                    "nudgeMs": { "type": "number" },
+                    "includeDrums": { "type": "boolean" },
+                    "beforeLabel": { "type": "string" },
+                    "afterLabel": { "type": "string" },
+                    "html": { "type": "string" }
+                }
+            },
             "prompt": { "type": "string" },
             "correctAnswer": { "type": "string" },
             "distractors": {
@@ -233,11 +288,62 @@ enum RawDistractor {
     Plain(String),
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RawMedia {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    reveal: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    caption: String,
+    #[serde(default)]
+    values: Vec<f32>,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default)]
+    flow_steps: Vec<FlowStep>,
+    #[serde(default)]
+    left_title: String,
+    #[serde(default)]
+    left_points: Vec<String>,
+    #[serde(default)]
+    right_title: String,
+    #[serde(default)]
+    right_points: Vec<String>,
+    #[serde(default)]
+    bpm: f32,
+    #[serde(default)]
+    base_hz: f32,
+    #[serde(default)]
+    cutoff_start_hz: f32,
+    #[serde(default)]
+    cutoff_end_hz: f32,
+    #[serde(default)]
+    accent_step: i32,
+    #[serde(default)]
+    nudge_ms: f32,
+    #[serde(default)]
+    include_drums: bool,
+    #[serde(default)]
+    before_label: String,
+    #[serde(default)]
+    after_label: String,
+    #[serde(default)]
+    html: String,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawQuestion {
     #[serde(default)]
     goal: String,
+    #[serde(default)]
+    hint: String,
+    #[serde(default)]
+    media: Option<RawMedia>,
     prompt: String,
     correct_answer: String,
     distractors: Vec<RawDistractor>,
@@ -378,14 +484,78 @@ pub fn parse_and_shuffle_question(val: Value) -> Result<GeneratedQuestion> {
         raw.angle_summary.trim().chars().take(120).collect()
     };
 
+    let media = raw.media.and_then(convert_raw_media);
+
     Ok(GeneratedQuestion {
-        goal: raw.goal.trim().chars().take(240).collect(),
+        goal: raw.goal.trim().chars().take(280).collect(),
+        hint: raw.hint.trim().chars().take(200).collect(),
+        media,
         prompt,
         choices,
         correct_choice_id,
         explanation,
         angle_summary,
     })
+}
+
+fn convert_raw_media(m: RawMedia) -> Option<ExampleMedia> {
+    let reveal = if m.reveal.trim().eq_ignore_ascii_case("after_answer") {
+        MediaReveal::AfterAnswer
+    } else {
+        MediaReveal::BeforeAnswer
+    };
+    let title = m.title.trim().chars().take(90).collect::<String>();
+    let caption = m.caption.trim().chars().take(240).collect::<String>();
+
+    match m.kind.trim().to_lowercase().as_str() {
+        "curve" if m.values.len() >= 3 => Some(ExampleMedia::Curve {
+            title: if title.is_empty() { "Visual Curve".into() } else { title },
+            caption,
+            reveal,
+            values: m.values.into_iter().take(24).map(|v| v.clamp(0.0, 1.0)).collect(),
+            labels: m.labels.into_iter().take(24).collect(),
+        }),
+        "flow" if m.flow_steps.len() >= 2 => Some(ExampleMedia::Flow {
+            title: if title.is_empty() { "Step Flow".into() } else { title },
+            caption,
+            reveal,
+            steps: m.flow_steps.into_iter().take(6).collect(),
+        }),
+        "contrast" if !m.left_points.is_empty() && !m.right_points.is_empty() => {
+            Some(ExampleMedia::Contrast {
+                title: if title.is_empty() { "Side-by-Side Comparison".into() } else { title },
+                caption,
+                reveal,
+                left_title: if m.left_title.trim().is_empty() { "Option A".into() } else { m.left_title.trim().to_string() },
+                left_points: m.left_points.into_iter().take(4).collect(),
+                right_title: if m.right_title.trim().is_empty() { "Option B".into() } else { m.right_title.trim().to_string() },
+                right_points: m.right_points.into_iter().take(4).collect(),
+            })
+        }
+        "audio" => Some(ExampleMedia::Audio {
+            title: if title.is_empty() { "Audio Example".into() } else { title },
+            caption,
+            reveal,
+            spec: AudioDemoSpec {
+                bpm: if m.bpm > 40.0 { m.bpm } else { 128.0 },
+                base_hz: if m.base_hz > 30.0 { m.base_hz } else { 110.0 },
+                cutoff_start_hz: if m.cutoff_start_hz > 60.0 { m.cutoff_start_hz } else { 350.0 },
+                cutoff_end_hz: if m.cutoff_end_hz > 60.0 { m.cutoff_end_hz } else { 3200.0 },
+                accent_step: if (1..=16).contains(&m.accent_step) { Some(m.accent_step as u8) } else { None },
+                nudge_ms: m.nudge_ms,
+                include_drums: m.include_drums,
+                before_label: if m.before_label.trim().is_empty() { None } else { Some(m.before_label.trim().to_string()) },
+                after_label: if m.after_label.trim().is_empty() { None } else { Some(m.after_label.trim().to_string()) },
+            },
+        }),
+        "interactive_html" if m.html.trim().len() >= 20 => Some(ExampleMedia::InteractiveHtml {
+            title: if title.is_empty() { "Interactive Sandbox".into() } else { title },
+            caption,
+            reveal,
+            html: m.html,
+        }),
+        _ => None,
+    }
 }
 
 pub fn parse_clarifying_analysis(val: Value, current_concept_title: &str) -> Result<ClarifyingAnalysis> {
@@ -524,6 +694,14 @@ pub fn build_question_prompt(directive: &SchedulerDirective) -> String {
     lines.push("Pedagogical & Clarity Rules:".into());
     lines.push("- Write in clear, concrete, everyday language matched to the learner's level. Briefly define any domain jargon inline instead of assuming the learner already knows it.".into());
     lines.push("- `goal`: 1-2 plain-English sentences explaining the HUMAN, EMOTIONAL, PERCEPTUAL, or PRACTICAL WHY first—why a real practitioner would want this effect or outcome in the first place (e.g., what feeling, tension, groove, or real-world problem it solves), not just dry mechanics.".into());
+    lines.push("- `hint`: 1 crisp sentence nudging the learner toward the mental model WITHOUT revealing or naming the correct choice.".into());
+    lines.push("- `media`: Use your judgment to decide if a concrete visual, audible, or interactive example makes this SPECIFIC question click faster. Pick ONE `kind` (and set unused fields to empty strings/arrays/0):".into());
+    lines.push("  * `curve`: 4-16 normalized values (0.0..1.0) + short labels (great for filter sweeps, 16-step rhythm accents, math functions, envelopes, Big-O curves).".into());
+    lines.push("  * `flow`: 2-5 connected `flowSteps` (`label`, `note`) (great for signal chains, protocols, lifecycles, pipelines).".into());
+    lines.push("  * `contrast`: side-by-side comparison (`leftTitle`/`leftPoints` vs `rightTitle`/`rightPoints`, great for separating confused concepts—usually `reveal: \"after_answer\"`).".into());
+    lines.push("  * `audio`: ONLY for sound/music/acoustics topics—specify `bpm`, `baseHz`, `cutoffStartHz`, `cutoffEndHz`, `accentStep` (1..16 or 0), `nudgeMs`, `includeDrums`, `beforeLabel`, `afterLabel` so our built-in Rust synth lets the user hear Before vs After! Set `reveal: \"after_answer\"` if hearing it would spoil the answer, or `\"before_answer\"` if it frames the question.".into());
+    lines.push("  * `interactive_html`: ONLY when a tiny self-contained offline HTML/SVG/Canvas/WebAudio interactive toy (dark background `#0b0f17`, zero external scripts/CDNs) adds real hands-on insight.".into());
+    lines.push("  * `none`: When plain prose is cleanest (don't force media when it doesn't help).".into());
     lines.push("- `prompt`: Clear, unambiguous scenario and question directly tied to that felt/practical goal.".into());
     lines.push("- Exactly 1 unambiguously correct answer and 3 plausible, similar-length distractors (never 'All of the above').".into());
     lines.push("- For EACH distractor, provide `trapKind` ('confuses_concept' | 'misconception' | 'careless'), `trapTarget`, and `whyWrong` (1 crisp sentence explaining what picking THAT specific option would actually feel like or cause instead of the desired goal).".into());
@@ -1006,6 +1184,34 @@ fn demo_question(directive: &SchedulerDirective) -> Value {
     };
     json!({
         "goal": format!("Build a clear mental model of how \"{}\" serves real outcomes in {}.", directive.concept.title, directive.compressed_context.topic_title),
+        "hint": format!("Focus on the core purpose of \"{}\" rather than surface shortcuts.", directive.concept.title),
+        "media": {
+            "kind": "flow",
+            "reveal": "before_answer",
+            "title": format!("{} Flow", directive.concept.title),
+            "caption": "How the core mental model connects input, mechanism, and outcome.",
+            "values": [],
+            "labels": [],
+            "flowSteps": [
+                { "label": "Context", "note": directive.compressed_context.topic_title },
+                { "label": directive.concept.title, "note": "Core mechanism" },
+                { "label": "Intended Effect", "note": "Predictable result" }
+            ],
+            "leftTitle": "",
+            "leftPoints": [],
+            "rightTitle": "",
+            "rightPoints": [],
+            "bpm": 0,
+            "baseHz": 0,
+            "cutoffStartHz": 0,
+            "cutoffEndHz": 0,
+            "accentStep": 0,
+            "nudgeMs": 0,
+            "includeDrums": false,
+            "beforeLabel": "",
+            "afterLabel": "",
+            "html": ""
+        },
         "prompt": format!("[{tag}] In {}, which statement best captures \"{}\"?", directive.compressed_context.topic_title, directive.concept.title),
         "correctAnswer": directive.concept.summary,
         "distractors": [
