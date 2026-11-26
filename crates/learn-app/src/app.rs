@@ -1197,16 +1197,17 @@ impl LearnApp {
         };
 
         let mut card = div()
-            .w(px(440.0))
+            .w(px(450.0))
             .max_w_full()
             .p_7()
-            .rounded_xl()
+            .rounded_md()
             .bg(theme::bg_card())
             .border_1()
             .border_color(theme::border_subtle())
             .flex()
             .flex_col()
             .gap_4()
+            .child(div().w_full().h(px(2.0)).bg(theme::accent()))
             .child(
                 div()
                     .flex()
@@ -1216,16 +1217,30 @@ impl LearnApp {
                     .min_w_0()
                     .child(
                         div()
-                            .text_2xl()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(theme::text_primary())
-                            .child("Learn"),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().size(px(8.0)).rounded_full().bg(theme::accent()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme::accent_text())
+                                    .child("LEARN // COGNITIVE MESH"),
+                            ),
                     )
                     .child(
                         div()
-                            .text_sm()
+                            .text_2xl()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text_primary())
+                            .child("OPERATOR ACCESS"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
                             .text_color(theme::text_secondary())
-                            .child("Neuro-symbolic Cognitive Mesh & live AI adaptive training"),
+                            .child("Adaptive neural-symbolic training · local-first intelligence"),
                     )
                     .child(
                         div()
@@ -1473,22 +1488,28 @@ impl LearnApp {
                 .w_full()
                 .px_3()
                 .py_2()
-                .rounded_md()
+                .rounded_sm()
+                .border_l_2()
+                .border_color(if active {
+                    theme::accent()
+                } else {
+                    theme::transparent()
+                })
                 .cursor_pointer()
                 .bg(if active {
-                    theme::accent_soft()
+                    theme::bg_card()
                 } else {
                     theme::transparent()
                 })
                 .hover(|s| s.bg(theme::bg_card_hover()))
-                .text_sm()
+                .text_xs()
                 .font_weight(if active {
                     gpui::FontWeight::SEMIBOLD
                 } else {
                     gpui::FontWeight::NORMAL
                 })
                 .text_color(if active {
-                    theme::accent_text()
+                    theme::text_primary()
                 } else {
                     theme::text_secondary()
                 })
@@ -1591,12 +1612,31 @@ impl LearnApp {
                     .gap_1()
                     .w_full()
                     .min_w_0()
+                    .pb_3()
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
                     .child(
                         div()
-                            .text_lg()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(theme::text_primary())
-                            .child("Learn"),
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(theme::text_primary())
+                                    .child("LEARN // OS"),
+                            )
+                            .child(
+                                div()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_xs()
+                                    .bg(theme::accent_soft())
+                                    .text_xs()
+                                    .text_color(theme::accent_text())
+                                    .child("LIVE"),
+                            ),
                     )
                     .child(
                         div()
@@ -1607,10 +1647,10 @@ impl LearnApp {
                             .min_w_0()
                             .child(
                                 div()
-                                    .size(px(8.0))
+                                    .size(px(6.0))
                                     .flex_shrink_0()
                                     .rounded_full()
-                                    .bg(theme::emerald()),
+                                    .bg(theme::accent()),
                             )
                             .child(
                                 div()
@@ -1778,7 +1818,7 @@ impl LearnApp {
                 .w_full()
                 .min_w_0()
                 .p_6()
-                .rounded_xl()
+                .rounded_md()
                 .bg(theme::bg_card())
                 .border_1()
                 .border_color(theme::border_subtle())
@@ -1881,7 +1921,7 @@ impl LearnApp {
                     .w_full()
                     .min_w_0()
                     .p_6()
-                    .rounded_xl()
+                    .rounded_md()
                     .bg(theme::bg_card())
                     .border_1()
                     .border_color(theme::border_subtle())
@@ -1907,7 +1947,7 @@ impl LearnApp {
                         .w_full()
                         .min_w_0()
                         .p_5()
-                        .rounded_xl()
+                        .rounded_md()
                         .bg(theme::bg_card())
                         .border_1()
                         .border_color(theme::border_subtle())
@@ -2099,11 +2139,11 @@ impl LearnApp {
                                 div()
                                     .w_full()
                                     .h(px(54.0 * v))
-                                    .rounded_t_sm()
+                                    .rounded_t_xs()
                                     .bg(if v >= 0.72 {
-                                        theme::emerald()
-                                    } else {
                                         theme::accent()
+                                    } else {
+                                        theme::emerald()
                                     }),
                             )
                             .when(!lbl.is_empty(), |el| {
@@ -2643,7 +2683,7 @@ impl LearnApp {
                     .w_full()
                     .min_w_0()
                     .p_8()
-                    .rounded_xl()
+                    .rounded_md()
                     .bg(theme::bg_card())
                     .border_1()
                     .border_color(theme::accent())
@@ -2676,7 +2716,7 @@ impl LearnApp {
                     .w_full()
                     .min_w_0()
                     .p_6()
-                    .rounded_xl()
+                    .rounded_md()
                     .bg(theme::bg_card())
                     .text_sm()
                     .text_color(theme::text_secondary())
@@ -2707,7 +2747,7 @@ impl LearnApp {
             .w_full()
             .min_w_0()
             .p_6()
-            .rounded_xl()
+            .rounded_md()
             .bg(theme::bg_card())
             .border_1()
             .border_color(theme::border_subtle())
@@ -2829,12 +2869,13 @@ impl LearnApp {
         }
 
         let mut choices_col = div().w_full().min_w_0().flex().flex_col().gap_2p5();
+        // Correct/wrong choice badges: crisp high-contrast black text on pure-white correct badge!
         for (idx, choice) in q.choices.iter().enumerate() {
             let cid = choice.id.clone();
             let is_picked = self.selected_choice_id.as_deref() == Some(choice.id.as_str());
             let (bg, border, badge_bg, badge_fg) = if let Some(ans) = &self.last_answer {
                 if choice.id == ans.correct_choice_id {
-                    (theme::emerald_soft(), theme::emerald(), theme::emerald(), theme::pure_white())
+                    (theme::emerald_soft(), theme::emerald(), theme::emerald(), theme::bg_canvas())
                 } else if choice.id == ans.selected_choice_id && !ans.is_correct {
                     (theme::rose_soft(), theme::rose(), theme::rose(), theme::pure_white())
                 } else {
@@ -2843,7 +2884,7 @@ impl LearnApp {
             } else if is_picked {
                 (theme::accent_soft(), theme::accent(), theme::accent(), theme::pure_white())
             } else {
-                (theme::bg_input(), theme::border_subtle(), theme::accent_soft(), theme::accent_text())
+                (theme::bg_input(), theme::border_subtle(), theme::bg_card(), theme::text_secondary())
             };
 
             let answered = self.last_answer.is_some();
@@ -3049,7 +3090,7 @@ impl LearnApp {
                 .w_full()
                 .min_w_0()
                 .p_5()
-                .rounded_xl()
+                .rounded_md()
                 .bg(fb_bg)
                 .border_1()
                 .border_color(fb_border)
@@ -3203,7 +3244,7 @@ impl LearnApp {
             .w_full()
             .min_w_0()
             .p_5()
-            .rounded_xl()
+            .rounded_md()
             .bg(theme::bg_card())
             .border_1()
             .border_color(theme::border_subtle())
@@ -3510,7 +3551,7 @@ impl LearnApp {
                 .w_full()
                 .min_w_0()
                 .p_5()
-                .rounded_xl()
+                .rounded_md()
                 .bg(theme::bg_card())
                 .border_1()
                 .border_color(theme::border_subtle())
@@ -4017,7 +4058,7 @@ impl LearnApp {
                 .w_full()
                 .min_w_0()
                 .p_5()
-                .rounded_xl()
+                .rounded_md()
                 .bg(theme::bg_card())
                 .border_1()
                 .border_color(theme::border_subtle())
