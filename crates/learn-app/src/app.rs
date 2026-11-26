@@ -1,6 +1,83 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+#[derive(Default)]
+struct GlobalAudioState {
+    child: Option<Child>,
+    shutting_down: bool,
+}
+
+static GLOBAL_AUDIO: OnceLock<Mutex<GlobalAudioState>> = OnceLock::new();
+
+fn global_audio_slot() -> &'static Mutex<GlobalAudioState> {
+    GLOBAL_AUDIO.get_or_init(|| Mutex::new(GlobalAudioState::default()))
+}
+
+fn kill_child(child: &mut Option<Child>) {
+    if let Some(mut c) = child.take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+}
+
+/// Immediately kills and reaps any active `afplay` audio subprocess.
+pub fn stop_global_audio() {
+    if let Ok(mut guard) = global_audio_slot().lock() {
+        kill_child(&mut guard.child);
+    }
+}
+
+/// Permanently halts audio playback for app shutdown so no background loop can respawn `afplay`.
+pub fn shutdown_global_audio() {
+    if let Ok(mut guard) = global_audio_slot().lock() {
+        guard.shutting_down = true;
+        kill_child(&mut guard.child);
+    }
+}
+
+fn is_audio_shutting_down() -> bool {
+    global_audio_slot()
+        .lock()
+        .map(|g| g.shutting_down)
+        .unwrap_or(true)
+}
+
+fn has_global_audio_running() -> bool {
+    global_audio_slot()
+        .lock()
+        .map(|g| !g.shutting_down && g.child.is_some())
+        .unwrap_or(false)
+}
+
+fn spawn_global_audio(path: &Path) -> std::io::Result<bool> {
+    let mut guard = global_audio_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    kill_child(&mut guard.child);
+    if guard.shutting_down {
+        return Ok(false);
+    }
+    let child = Command::new("afplay").arg(path).spawn()?;
+    guard.child = Some(child);
+    Ok(true)
+}
+
+fn global_audio_exited() -> bool {
+    if let Ok(mut guard) = global_audio_slot().lock() {
+        if guard.shutting_down {
+            kill_child(&mut guard.child);
+            return true;
+        }
+        match guard.child.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+            None => true,
+        }
+    } else {
+        true
+    }
+}
 
 use gpui::{
     AnyElement, AsyncApp, ClickEvent, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent,
@@ -66,7 +143,6 @@ pub struct LearnApp {
     last_answer: Option<AnswerResult>,
 
     // Audio preview playback, looping, & realtime step playhead
-    audio_child: Option<Child>,
     audio_status: Option<String>,
     audio_showing_after: bool,
     audio_preview_spec: Option<AudioDemoSpec>,
@@ -92,6 +168,12 @@ pub struct LearnApp {
     anim_running: bool,
     error_banner: Option<String>,
     info_banner: Option<String>,
+}
+
+impl Drop for LearnApp {
+    fn drop(&mut self) {
+        shutdown_global_audio();
+    }
 }
 
 impl Focusable for LearnApp {
@@ -148,7 +230,6 @@ impl LearnApp {
             selected_choice_id: None,
             hint_revealed: false,
             last_answer: None,
-            audio_child: None,
             audio_status: None,
             audio_showing_after: false,
             audio_preview_spec: None,
@@ -534,10 +615,7 @@ impl LearnApp {
     }
 
     fn stop_audio_quiet(&mut self) {
-        if let Some(mut child) = self.audio_child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        stop_global_audio();
         self.audio_status = None;
         self.audio_showing_after = false;
         self.audio_preview_spec = None;
@@ -548,7 +626,7 @@ impl LearnApp {
     }
 
     fn ensure_audio_playhead_loop(&mut self, cx: &mut Context<Self>) {
-        if self.audio_playhead_running || self.audio_child.is_none() {
+        if self.audio_playhead_running || !has_global_audio_running() {
             return;
         }
         self.audio_playhead_running = true;
@@ -561,16 +639,12 @@ impl LearnApp {
 
                 let mut keep_running = false;
                 let updated = this.update(cx, |view, cx| {
-                    let exited = match view.audio_child.as_mut() {
-                        Some(child) => matches!(child.try_wait(), Ok(Some(_))),
-                        None => true,
-                    };
+                    let exited = global_audio_exited();
 
                     if exited {
-                        if view.audio_looping {
+                        if !is_audio_shutting_down() && view.audio_looping {
                             if let Some(wav) = view.audio_wav_path.clone() {
-                                if let Ok(child) = Command::new("afplay").arg(&wav).spawn() {
-                                    view.audio_child = Some(child);
+                                if matches!(spawn_global_audio(&wav), Ok(true)) {
                                     view.audio_started_at = Some(Instant::now());
                                     view.audio_active_step = Some(0);
                                     keep_running = true;
@@ -579,7 +653,7 @@ impl LearnApp {
                                 }
                             }
                         }
-                        view.audio_child = None;
+                        stop_global_audio();
                         view.audio_started_at = None;
                         view.audio_active_step = None;
                         view.audio_status = None;
@@ -704,9 +778,8 @@ impl LearnApp {
         };
 
         match synthesize_audio_wav_bars(&spec, dry_before, bars, &wav_path) {
-            Ok(path) => match Command::new("afplay").arg(&path).spawn() {
-                Ok(child) => {
-                    self.audio_child = Some(child);
+            Ok(path) => match spawn_global_audio(&path) {
+                Ok(true) => {
                     self.audio_wav_path = Some(path);
                     self.audio_showing_after = !dry_before && preview_override.is_none();
                     self.audio_preview_spec = preview_override;
@@ -723,6 +796,7 @@ impl LearnApp {
                     self.error_banner = None;
                     self.ensure_audio_playhead_loop(cx);
                 }
+                Ok(false) => {}
                 Err(err) => {
                     self.error_banner = Some(format!("Audio playback unavailable (`afplay`): {err}"));
                 }
@@ -1018,10 +1092,12 @@ impl LearnApp {
         let cmd_or_ctrl = cmd || ctrl;
 
         if cmd_or_ctrl && ks.key.eq_ignore_ascii_case("q") {
+            shutdown_global_audio();
             cx.quit();
             return;
         }
         if cmd && ks.key.eq_ignore_ascii_case("w") {
+            shutdown_global_audio();
             window.remove_window();
             return;
         }
@@ -3011,7 +3087,7 @@ impl LearnApp {
                                     "[LOOP: OFF]"
                                 }),
                         )
-                        .when(self.audio_child.is_some(), |el| {
+                        .when(has_global_audio_running(), |el| {
                             el.child(
                                 div()
                                     .id("btn-audio-stop")
@@ -4933,9 +5009,11 @@ impl Render for LearnApp {
             .font_family(theme::mono_font())
             .track_focus(&self.focus_handle)
             .on_action(|_: &CloseWindow, window, _| {
+                shutdown_global_audio();
                 window.remove_window();
             })
             .on_action(|_: &QuitApp, _, cx| {
+                shutdown_global_audio();
                 cx.quit();
             })
             .size_full()

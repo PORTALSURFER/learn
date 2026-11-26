@@ -8,7 +8,7 @@ use gpui::{
 };
 use learn_core::LearnService;
 
-use crate::app::LearnApp;
+use crate::app::{LearnApp, shutdown_global_audio};
 
 actions!(learn_app, [CloseWindow, QuitApp]);
 
@@ -22,12 +22,20 @@ fn main() {
         ]);
 
         cx.on_action(|_: &QuitApp, cx| {
+            shutdown_global_audio();
             cx.quit();
         });
 
-        // On macOS, closing the last window via the red traffic light or Cmd+W must explicitly quit.
+        cx.on_app_quit(|_cx| {
+            shutdown_global_audio();
+            async {}
+        })
+        .detach();
+
+        // On macOS, closing the last window via the red traffic light or Cmd+W must stop audio and quit.
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
+                shutdown_global_audio();
                 cx.quit();
             }
         })
@@ -52,6 +60,7 @@ fn main() {
         cx.activate(true);
     });
 
-    // Ensure no detached background CLI prefetch thread keeps the process alive after UI exit.
+    // Stop any lingering audio subprocess and ensure no detached prefetch thread keeps the process alive.
+    shutdown_global_audio();
     std::process::exit(0);
 }
