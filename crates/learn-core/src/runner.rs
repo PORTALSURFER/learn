@@ -113,6 +113,61 @@ pub fn concept_map_schema() -> Value {
     })
 }
 
+pub fn media_object_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "kind", "reveal", "title", "caption",
+            "values", "labels", "flowSteps",
+            "leftTitle", "leftPoints", "rightTitle", "rightPoints",
+            "bpm", "baseHz", "cutoffStartHz", "cutoffEndHz",
+            "accentStep", "nudgeMs", "includeDrums",
+            "beforeLabel", "afterLabel", "html"
+        ],
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["none", "curve", "flow", "contrast", "audio", "interactive_html"]
+            },
+            "reveal": {
+                "type": "string",
+                "enum": ["before_answer", "after_answer"]
+            },
+            "title": { "type": "string" },
+            "caption": { "type": "string" },
+            "values": { "type": "array", "items": { "type": "number" } },
+            "labels": { "type": "array", "items": { "type": "string" } },
+            "flowSteps": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["label", "note"],
+                    "properties": {
+                        "label": { "type": "string" },
+                        "note": { "type": "string" }
+                    }
+                }
+            },
+            "leftTitle": { "type": "string" },
+            "leftPoints": { "type": "array", "items": { "type": "string" } },
+            "rightTitle": { "type": "string" },
+            "rightPoints": { "type": "array", "items": { "type": "string" } },
+            "bpm": { "type": "number" },
+            "baseHz": { "type": "number" },
+            "cutoffStartHz": { "type": "number" },
+            "cutoffEndHz": { "type": "number" },
+            "accentStep": { "type": "integer" },
+            "nudgeMs": { "type": "number" },
+            "includeDrums": { "type": "boolean" },
+            "beforeLabel": { "type": "string" },
+            "afterLabel": { "type": "string" },
+            "html": { "type": "string" }
+        }
+    })
+}
+
 pub fn question_schema() -> Value {
     json!({
         "type": "object",
@@ -121,58 +176,7 @@ pub fn question_schema() -> Value {
         "properties": {
             "goal": { "type": "string" },
             "hint": { "type": "string" },
-            "media": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": [
-                    "kind", "reveal", "title", "caption",
-                    "values", "labels", "flowSteps",
-                    "leftTitle", "leftPoints", "rightTitle", "rightPoints",
-                    "bpm", "baseHz", "cutoffStartHz", "cutoffEndHz",
-                    "accentStep", "nudgeMs", "includeDrums",
-                    "beforeLabel", "afterLabel", "html"
-                ],
-                "properties": {
-                    "kind": {
-                        "type": "string",
-                        "enum": ["none", "curve", "flow", "contrast", "audio", "interactive_html"]
-                    },
-                    "reveal": {
-                        "type": "string",
-                        "enum": ["before_answer", "after_answer"]
-                    },
-                    "title": { "type": "string" },
-                    "caption": { "type": "string" },
-                    "values": { "type": "array", "items": { "type": "number" } },
-                    "labels": { "type": "array", "items": { "type": "string" } },
-                    "flowSteps": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": ["label", "note"],
-                            "properties": {
-                                "label": { "type": "string" },
-                                "note": { "type": "string" }
-                            }
-                        }
-                    },
-                    "leftTitle": { "type": "string" },
-                    "leftPoints": { "type": "array", "items": { "type": "string" } },
-                    "rightTitle": { "type": "string" },
-                    "rightPoints": { "type": "array", "items": { "type": "string" } },
-                    "bpm": { "type": "number" },
-                    "baseHz": { "type": "number" },
-                    "cutoffStartHz": { "type": "number" },
-                    "cutoffEndHz": { "type": "number" },
-                    "accentStep": { "type": "integer" },
-                    "nudgeMs": { "type": "number" },
-                    "includeDrums": { "type": "boolean" },
-                    "beforeLabel": { "type": "string" },
-                    "afterLabel": { "type": "string" },
-                    "html": { "type": "string" }
-                }
-            },
+            "media": media_object_schema(),
             "prompt": { "type": "string" },
             "correctAnswer": { "type": "string" },
             "distractors": {
@@ -695,13 +699,13 @@ pub fn build_question_prompt(directive: &SchedulerDirective) -> String {
     lines.push("- Write in clear, concrete, everyday language matched to the learner's level. Briefly define any domain jargon inline instead of assuming the learner already knows it.".into());
     lines.push("- `goal`: 1-2 plain-English sentences explaining the HUMAN, EMOTIONAL, PERCEPTUAL, or PRACTICAL WHY first—why a real practitioner would want this effect or outcome in the first place (e.g., what feeling, tension, groove, or real-world problem it solves), not just dry mechanics.".into());
     lines.push("- `hint`: 1 crisp sentence nudging the learner toward the mental model WITHOUT revealing or naming the correct choice.".into());
-    lines.push("- `media`: Use your judgment to decide if a concrete visual, audible, or interactive example makes this SPECIFIC question click faster. Pick ONE `kind` (and set unused fields to empty strings/arrays/0):".into());
-    lines.push("  * `curve`: 4-16 normalized values (0.0..1.0) + short labels (great for filter sweeps, 16-step rhythm accents, math functions, envelopes, Big-O curves).".into());
-    lines.push("  * `flow`: 2-5 connected `flowSteps` (`label`, `note`) (great for signal chains, protocols, lifecycles, pipelines).".into());
-    lines.push("  * `contrast`: side-by-side comparison (`leftTitle`/`leftPoints` vs `rightTitle`/`rightPoints`, great for separating confused concepts—usually `reveal: \"after_answer\"`).".into());
-    lines.push("  * `audio`: ONLY for sound/music/acoustics topics—specify `bpm`, `baseHz`, `cutoffStartHz`, `cutoffEndHz`, `accentStep` (1..16 or 0), `nudgeMs`, `includeDrums`, `beforeLabel`, `afterLabel` so our built-in Rust synth lets the user hear Before vs After! Set `reveal: \"after_answer\"` if hearing it would spoil the answer, or `\"before_answer\"` if it frames the question.".into());
-    lines.push("  * `interactive_html`: ONLY when a tiny self-contained offline HTML/SVG/Canvas/WebAudio interactive toy (dark background `#0b0f17`, zero external scripts/CDNs) adds real hands-on insight.".into());
-    lines.push("  * `none`: When plain prose is cleanest (don't force media when it doesn't help).".into());
+    lines.push("- `media`: ACTIVELY include a concrete supporting example on almost every question (`reveal: \"before_answer\"` by default!) so the learner can SEE, HEAR, or FEEL the goal and setup before answering—without spoiling which option A-D is correct. Pick the SINGLE best modality for this specific topic & question (unused fields = empty string/array/0):".into());
+    lines.push("  * `audio`: STRONGLY PREFERRED for music, sound design, rhythm, groove, or acoustics questions! Set `bpm`, `baseHz`, `cutoffStartHz`, `cutoffEndHz`, `accentStep` (1..16 or 0), `nudgeMs`, `includeDrums`, `beforeLabel`, `afterLabel` so our built-in Rust synth lets the learner HEAR the sound/groove live right inside the question! Use `reveal: \"before_answer\"` to let them hear the starting loop or compare the sonic feel directly.".into());
+    lines.push("  * `curve`: 4-16 normalized values (0.0..1.0) + concise labels — ideal for filter/energy curves, 16-step velocity/accent grids, math functions, growth curves, or envelopes.".into());
+    lines.push("  * `flow`: 2-5 connected `flowSteps` (`label`, `note`) — ideal for signal chains, protocols, lifecycles, causal steps, or pipelines.".into());
+    lines.push("  * `contrast`: side-by-side comparison (`leftTitle`/`leftPoints` vs `rightTitle`/`rightPoints`) — ideal for clarifying two competing forces or setups in the question.".into());
+    lines.push("  * `interactive_html`: a compact self-contained offline HTML/SVG/Canvas/WebAudio interactive toy (dark background `#050506`, crisp white/grey text, `#E11D2E` red accent, zero external scripts/CDNs) when a live slider/sandbox makes the concept click instantly.".into());
+    lines.push("  * `none`: Use ONLY when a visual/audio/interactive example genuinely adds zero clarity.".into());
     lines.push("- `prompt`: Clear, unambiguous scenario and question directly tied to that felt/practical goal.".into());
     lines.push("- Exactly 1 unambiguously correct answer and 3 plausible, similar-length distractors (never 'All of the above').".into());
     lines.push("- For EACH distractor, provide `trapKind` ('confuses_concept' | 'misconception' | 'careless'), `trapTarget`, and `whyWrong` (1 crisp sentence explaining what picking THAT specific option would actually feel like or cause instead of the desired goal).".into());
@@ -939,6 +943,58 @@ impl AiRunner {
         );
         let json_val = self.run_json_prompt(&prompt, &clarifying_schema(), cfg)?;
         parse_clarifying_analysis(json_val, concept_title)
+    }
+
+    /// Generates an AI-chosen supporting example (`audio`, `curve`, `flow`, `contrast`, or `interactive_html`)
+    /// specifically tailored to help the learner understand an existing question's goal and setup.
+    pub fn generate_supporting_media(
+        &self,
+        topic_title: &str,
+        level: SkillLevel,
+        concept_title: &str,
+        goal: &str,
+        question_prompt: &str,
+        already_answered: bool,
+        cfg: &RunnerConfig,
+    ) -> Result<ExampleMedia> {
+        if cfg.kind == RunnerKind::Demo {
+            return Ok(ExampleMedia::Flow {
+                title: format!("{concept_title} Mental Model"),
+                caption: "Visual breakdown connecting the starting setup to the intended effect.".into(),
+                reveal: MediaReveal::BeforeAnswer,
+                steps: vec![
+                    FlowStep { label: "Setup".into(), note: topic_title.to_string() },
+                    FlowStep { label: concept_title.to_string(), note: "Key mechanism".into() },
+                    FlowStep { label: "Felt Result".into(), note: "Target outcome".into() },
+                ],
+            });
+        }
+
+        let spoiler_rule = if already_answered {
+            "The learner already answered, so you may illustrate the full before/after effect directly."
+        } else {
+            "The learner has NOT answered yet. Help them understand the goal, feel, or structure of the question WITHOUT spoiling which multiple-choice answer is right."
+        };
+
+        let prompt = format!(
+            "You are designing ONE concrete supporting example to help a {} learner understand this question in \"{topic_title}\".\n\
+             Concept: \"{concept_title}\"\n\
+             Goal: \"{goal}\"\n\
+             Question: \"{question_prompt}\"\n\
+             {spoiler_rule}\n\
+             Choose the SINGLE best modality (`audio`, `curve`, `flow`, `contrast`, or `interactive_html` — do NOT return `none`!) and set `reveal: \"before_answer\"`.\n\
+             - Pick `audio` for music/sound/rhythm/acoustics so our built-in Rust synth lets them hear it live.\n\
+             - Pick `curve` for 4-16 step grids, envelopes, sweeps, or math plots.\n\
+             - Pick `flow` for signal chains, protocols, or step-by-step mechanisms.\n\
+             - Pick `contrast` for comparing two setups/forces side-by-side.\n\
+             - Pick `interactive_html` for a compact self-contained offline dark-mode (`#050506`, `#F4F4F6`, `#E11D2E`) HTML/SVG/Canvas/WebAudio mini-lab.\n\
+             Return ONLY valid JSON matching the schema.",
+            level.as_str()
+        );
+
+        let val = self.run_json_prompt(&prompt, &media_object_schema(), cfg)?;
+        let raw: RawMedia = serde_json::from_value(val).context("invalid supporting media JSON")?;
+        convert_raw_media(raw).ok_or_else(|| anyhow!("AI did not produce a renderable supporting example."))
     }
 
     fn run_json_prompt(&self, prompt: &str, schema: &Value, cfg: &RunnerConfig) -> Result<Value> {

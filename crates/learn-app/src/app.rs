@@ -64,9 +64,10 @@ pub struct LearnApp {
     hint_revealed: bool,
     last_answer: Option<AnswerResult>,
 
-    // Audio preview playback
+    // Audio preview playback & on-demand supporting example generation
     audio_child: Option<Child>,
     audio_status: Option<String>,
+    media_busy: bool,
 
     // Live UI feedback
     busy_message: Option<String>,
@@ -138,6 +139,7 @@ impl LearnApp {
             last_answer: None,
             audio_child: None,
             audio_status: None,
+            media_busy: false,
             busy_message: None,
             prefetching: false,
             prefetch_topic_id: None,
@@ -209,6 +211,7 @@ impl LearnApp {
         self.selected_choice_id = None;
         self.hint_revealed = false;
         self.last_answer = None;
+        self.media_busy = false;
         self.stop_audio_quiet();
         self.busy_message = None;
         self.prefetching = false;
@@ -254,7 +257,7 @@ impl LearnApp {
     }
 
     fn is_ai_active(&self) -> bool {
-        self.busy_message.is_some() || self.prefetching || self.clarify_busy
+        self.busy_message.is_some() || self.prefetching || self.clarify_busy || self.media_busy
     }
 
     /// Runs a lightweight 120ms pulse timer ONLY while AI generation/prefetch/tutor is active.
@@ -366,6 +369,7 @@ impl LearnApp {
         self.selected_choice_id = None;
         self.hint_revealed = false;
         self.last_answer = None;
+        self.media_busy = false;
         self.stop_audio_quiet();
         self.clarify_input.clear();
         self.clarify_busy = false;
@@ -492,6 +496,52 @@ impl LearnApp {
             let _ = child.wait();
         }
         self.audio_status = None;
+    }
+
+    fn generate_supporting_example(&mut self, cx: &mut Context<Self>) {
+        let Some(user) = self.user.clone() else { return };
+        let Some(topic_id) = self.active_topic_id.clone() else { return };
+        let Some(question) = self.current_question.clone() else { return };
+        if self.media_busy {
+            return;
+        }
+        let already_answered = self.last_answer.is_some();
+        let service = self.service.clone();
+        self.media_busy = true;
+        self.error_banner = None;
+        self.ensure_anim_loop(cx);
+        cx.notify();
+
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    service.generate_question_example(&user, &topic_id, &question.id, already_answered)
+                })
+                .await;
+
+            this.update(cx, |view, cx| {
+                view.media_busy = false;
+                match res {
+                    Ok(updated_q) => {
+                        if view
+                            .current_question
+                            .as_ref()
+                            .map(|q| q.id == updated_q.id)
+                            .unwrap_or(false)
+                        {
+                            view.current_question = Some(updated_q);
+                        }
+                    }
+                    Err(err) => {
+                        view.error_banner = Some(err.to_string());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn play_audio_demo(
@@ -2969,11 +3019,83 @@ impl LearnApp {
                     .child(q.prompt.clone()),
             );
 
-        // Render AI-chosen media inline above choices if reveal == BeforeAnswer
+        // Render AI-chosen supporting example right inside the question card!
+        let has_inline_media = q
+            .media
+            .as_ref()
+            .map(|m| m.reveal() == MediaReveal::BeforeAnswer || self.last_answer.is_some())
+            .unwrap_or(false);
+
         if let Some(media) = &q.media {
             if media.reveal() == MediaReveal::BeforeAnswer {
                 q_card = q_card.child(self.render_example_media(media, &q.id, cx));
             }
+        }
+
+        if self.media_busy {
+            q_card = q_card.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .px_3p5()
+                    .py_2p5()
+                    .rounded_sm()
+                    .bg(theme::bg_input())
+                    .border_1()
+                    .border_color(theme::accent())
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .child(self.render_scifi_mini_scanner())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::accent_text())
+                            .child("SYNTHESIZING EXAMPLE // Choosing best visual, audio, or interactive lab..."),
+                    ),
+            );
+        } else if !has_inline_media && self.last_answer.is_none() {
+            let has_after_media = q
+                .media
+                .as_ref()
+                .map(|m| m.reveal() == MediaReveal::AfterAnswer)
+                .unwrap_or(false);
+            q_card = q_card.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("btn-gen-example")
+                            .px_3()
+                            .py_1p5()
+                            .rounded_sm()
+                            .bg(theme::bg_input())
+                            .border_1()
+                            .border_color(theme::border_subtle())
+                            .hover(|s| s.border_color(theme::accent()))
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(theme::text_primary())
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.generate_supporting_example(cx);
+                            }))
+                            .child("+ Generate Visual / Audio / Interactive Example"),
+                    )
+                    .when(has_after_media, |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::text_muted())
+                                .child("Comparison example also queued for feedback"),
+                        )
+                    }),
+            );
         }
 
         // Revealed Hint banner

@@ -1088,6 +1088,19 @@ impl KnowledgeStore {
         Ok(changed)
     }
 
+    pub fn update_question_media(
+        &self,
+        question_id: &str,
+        media: &ExampleMedia,
+    ) -> Result<Option<StoredQuestion>> {
+        let media_json = serde_json::to_string(media)?;
+        self.conn.execute(
+            "UPDATE questions SET media_json = ?1 WHERE id = ?2",
+            params![media_json, question_id],
+        )?;
+        self.get_question(question_id)
+    }
+
     pub fn mark_question_answered(
         &self,
         question_id: &str,

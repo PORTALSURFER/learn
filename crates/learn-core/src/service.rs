@@ -441,6 +441,44 @@ impl LearnService {
         })
     }
 
+    /// Generates and attaches an AI-chosen supporting example (`audio`, `curve`, `flow`, `contrast`,
+    /// or `interactive_html`) to an existing question on demand.
+    pub fn generate_question_example(
+        &self,
+        user: &User,
+        topic_id: &str,
+        question_id: &str,
+        already_answered: bool,
+    ) -> Result<StoredQuestion> {
+        let (topic, question) = {
+            let store = self.store.lock().unwrap();
+            let topic = store
+                .get_topic(topic_id, &user.id)?
+                .ok_or_else(|| anyhow!("Topic not found"))?;
+            let question = store
+                .get_question(question_id)?
+                .ok_or_else(|| anyhow!("Question not found"))?;
+            (topic, question)
+        };
+
+        let cfg = runner_cfg_for(user);
+        let media = self.runner.generate_supporting_media(
+            &topic.title,
+            topic.level,
+            &question.concept_title,
+            &question.goal,
+            &question.prompt,
+            already_answered,
+            &cfg,
+        )?;
+
+        self.store
+            .lock()
+            .unwrap()
+            .update_question_media(question_id, &media)?
+            .ok_or_else(|| anyhow!("Question not found after updating media"))
+    }
+
     pub fn expand_knowledge_map(&self, user: &User, topic_id: &str) -> Result<KnowledgeMap> {
         let (topic, existing_titles, next_depth) = {
             let store = self.store.lock().unwrap();
