@@ -523,11 +523,11 @@ pub fn build_question_prompt(directive: &SchedulerDirective) -> String {
 
     lines.push("Pedagogical & Clarity Rules:".into());
     lines.push("- Write in clear, concrete, everyday language matched to the learner's level. Briefly define any domain jargon inline instead of assuming the learner already knows it.".into());
-    lines.push("- `goal`: 1 plain-English sentence explaining WHAT we are trying to achieve with this technique/concept and WHY it matters in practice (shown above the question so the learner understands the purpose first).".into());
-    lines.push("- `prompt`: Clear, unambiguous scenario and question directly tied to that goal.".into());
+    lines.push("- `goal`: 1-2 plain-English sentences explaining the HUMAN, EMOTIONAL, PERCEPTUAL, or PRACTICAL WHY first—why a real practitioner would want this effect or outcome in the first place (e.g., what feeling, tension, groove, or real-world problem it solves), not just dry mechanics.".into());
+    lines.push("- `prompt`: Clear, unambiguous scenario and question directly tied to that felt/practical goal.".into());
     lines.push("- Exactly 1 unambiguously correct answer and 3 plausible, similar-length distractors (never 'All of the above').".into());
-    lines.push("- For EACH distractor, provide `trapKind` ('confuses_concept' | 'misconception' | 'careless'), `trapTarget`, and `whyWrong` (1 crisp sentence explaining what picking THAT specific option would actually cause instead of the goal).".into());
-    lines.push("- `explanation`: 2-3 clear sentences explaining (1) the underlying purpose/mental model, (2) why the right answer achieves it best, and (3) how the alternative directions produce different or undesired effects.".into());
+    lines.push("- For EACH distractor, provide `trapKind` ('confuses_concept' | 'misconception' | 'careless'), `trapTarget`, and `whyWrong` (1 crisp sentence explaining what picking THAT specific option would actually feel like or cause instead of the desired goal).".into());
+    lines.push("- `explanation`: 3 clear sentences bridging mechanics to real impact: (1) the emotional/perceptual/practical payoff of why you'd want this move in the first place, (2) how the right answer achieves that effect, and (3) why the alternative directions produce a different feeling or undesired outcome.".into());
     lines.push("- If `strong_bridges` has a mastered concept from another topic, feel free to weave in a brief analogy when explaining.".into());
     lines.push("- `angleSummary`: 4-8 words describing what angle this question tested.".into());
     lines.push("Return ONLY valid JSON: {\"goal\":\"...\",\"prompt\":\"...\",\"correctAnswer\":\"...\",\"distractors\":[{\"text\":\"...\",\"trapKind\":\"misconception\",\"trapTarget\":\"short_hypothesis\",\"whyWrong\":\"...\"},{\"text\":\"...\",\"trapKind\":\"confuses_concept\",\"trapTarget\":\"other_concept_slug\",\"whyWrong\":\"...\"},{\"text\":\"...\",\"trapKind\":\"careless\",\"trapTarget\":\"surface_pattern\",\"whyWrong\":\"...\"}],\"explanation\":\"...\",\"angleSummary\":\"...\"}".into());

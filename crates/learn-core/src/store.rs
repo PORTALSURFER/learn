@@ -233,6 +233,11 @@ impl KnowledgeStore {
         let _ = self
             .conn
             .execute("ALTER TABLE questions ADD COLUMN goal TEXT NOT NULL DEFAULT ''", []);
+        // Clear legacy unanswered buffered questions created before `goal` / `whyWrong` prompts existed
+        // so users immediately receive the upgraded question format after updating.
+        let _ = self
+            .conn
+            .execute("DELETE FROM questions WHERE answered_at IS NULL AND goal = ''", []);
         // Normalize legacy unseen rows (mastery=0.0, attempts=0) to the neutral Bayesian prior (0.50, σ=0.90)
         let _ = self.conn.execute(
             "UPDATE concepts SET mastery = ?1, uncertainty = ?2 WHERE attempts = 0 AND mastery = 0.0",
