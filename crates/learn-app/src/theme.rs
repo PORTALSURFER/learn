@@ -1,7 +1,18 @@
 use gpui::{Rgba, rgb, rgba};
 
-// Sleek Monochrome + Signal Red Sci-Fi Palette
-// Strictly carbon blacks, titanium greys, stark white, and laser red.
+// Modern Monochrome + Laser Red Terminal Palette
+// Pure carbon blacks, steel hairline borders, stark white, and signal red.
+
+pub fn mono_font() -> &'static str {
+    "Menlo"
+}
+
+pub fn ascii_bar(ratio: f64, width: usize) -> String {
+    let clamped = ratio.clamp(0.0, 1.0);
+    let filled = (clamped * width as f64).round() as usize;
+    let empty = width.saturating_sub(filled);
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
+}
 
 pub fn transparent() -> Rgba {
     rgba(0x00000000)
@@ -12,27 +23,27 @@ pub fn pure_white() -> Rgba {
 }
 
 pub fn bg_canvas() -> Rgba {
-    rgb(0x050506)
+    rgb(0x040405)
 }
 
 pub fn bg_sidebar() -> Rgba {
-    rgb(0x09090B)
-}
-
-pub fn bg_card() -> Rgba {
-    rgb(0x101014)
-}
-
-pub fn bg_card_hover() -> Rgba {
-    rgb(0x18181E)
-}
-
-pub fn bg_input() -> Rgba {
     rgb(0x08080A)
 }
 
+pub fn bg_card() -> Rgba {
+    rgb(0x0D0D11)
+}
+
+pub fn bg_card_hover() -> Rgba {
+    rgb(0x16161C)
+}
+
+pub fn bg_input() -> Rgba {
+    rgb(0x060608)
+}
+
 pub fn border_subtle() -> Rgba {
-    rgb(0x23232A)
+    rgb(0x24242C)
 }
 
 pub fn border_focus() -> Rgba {
@@ -44,11 +55,11 @@ pub fn text_primary() -> Rgba {
 }
 
 pub fn text_secondary() -> Rgba {
-    rgb(0xA1A1AA)
+    rgb(0x9A9AA6)
 }
 
 pub fn text_muted() -> Rgba {
-    rgb(0x63636E)
+    rgb(0x5C5C68)
 }
 
 // Primary Signal Red accent
@@ -61,7 +72,7 @@ pub fn accent_hover() -> Rgba {
 }
 
 pub fn accent_soft() -> Rgba {
-    rgb(0x240B0F)
+    rgb(0x21090D)
 }
 
 pub fn accent_text() -> Rgba {
@@ -74,20 +85,20 @@ pub fn emerald() -> Rgba {
 }
 
 pub fn emerald_soft() -> Rgba {
-    rgb(0x18181E)
+    rgb(0x15151B)
 }
 
 pub fn emerald_text() -> Rgba {
     rgb(0xFFFFFF)
 }
 
-// Caution / Review / Guessing -> Smoked Silver-Red Telemetry
+// Caution / Review / Guessing -> Steel Silver on Dark Charcoal
 pub fn amber() -> Rgba {
-    rgb(0xA1A1AA)
+    rgb(0x9A9AA6)
 }
 
 pub fn amber_soft() -> Rgba {
-    rgb(0x1B1719)
+    rgb(0x171416)
 }
 
 pub fn amber_text() -> Rgba {
@@ -100,7 +111,7 @@ pub fn rose() -> Rgba {
 }
 
 pub fn rose_soft() -> Rgba {
-    rgb(0x2A0A10)
+    rgb(0x26080E)
 }
 
 pub fn rose_text() -> Rgba {
@@ -109,7 +120,7 @@ pub fn rose_text() -> Rgba {
 
 // Technical / Structural Highlights -> Crisp Steel & White
 pub fn sky_soft() -> Rgba {
-    rgb(0x16161C)
+    rgb(0x14141A)
 }
 
 pub fn sky_text() -> Rgba {

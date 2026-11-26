@@ -1113,13 +1113,20 @@ impl LearnApp {
             div()
                 .flex_1()
                 .min_w_0()
-                .text_sm()
-                .text_color(theme::text_muted())
-                .child(if focused {
-                    format!("| {placeholder}")
-                } else {
-                    placeholder.to_string()
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_xs()
+                .when(focused, |el| {
+                    el.child(div().text_color(theme::accent_hover()).child("█"))
                 })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(theme::text_muted())
+                        .child(placeholder.to_string()),
+                )
                 .into_any_element()
         } else if focused {
             let mut row = div()
@@ -1128,7 +1135,7 @@ impl LearnApp {
                 .flex()
                 .flex_wrap()
                 .items_center()
-                .text_sm()
+                .text_xs()
                 .text_color(theme::text_primary());
 
             if !before.is_empty() {
@@ -1137,18 +1144,12 @@ impl LearnApp {
             if has_sel {
                 row = row.child(
                     div()
-                        .rounded_xs()
                         .bg(theme::accent())
                         .text_color(theme::pure_white())
                         .child(selected),
                 );
             } else {
-                row = row.child(
-                    div()
-                        .text_color(theme::accent_text())
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .child("|"),
-                );
+                row = row.child(div().text_color(theme::accent_hover()).child("█"));
             }
             if !after.is_empty() {
                 row = row.child(after);
@@ -1158,7 +1159,7 @@ impl LearnApp {
             div()
                 .flex_1()
                 .min_w_0()
-                .text_sm()
+                .text_xs()
                 .text_color(theme::text_primary())
                 .child(format!("{before}{selected}{after}"))
                 .into_any_element()
@@ -1174,15 +1175,15 @@ impl LearnApp {
                 div()
                     .w_full()
                     .text_xs()
-                    .text_color(theme::text_secondary())
-                    .child(label.to_string()),
+                    .text_color(theme::text_muted())
+                    .child(format!("// {}", label.to_uppercase())),
             )
             .child(
                 div()
                     .id(id)
                     .w_full()
                     .min_w_0()
-                    .min_h(px(40.0))
+                    .min_h(px(38.0))
                     .px_3()
                     .py_2()
                     .flex()
@@ -1190,7 +1191,7 @@ impl LearnApp {
                     .justify_between()
                     .gap_2()
                     .overflow_hidden()
-                    .rounded_md()
+                    .rounded_xs()
                     .bg(theme::bg_input())
                     .border_1()
                     .border_color(if focused {
@@ -1214,6 +1215,18 @@ impl LearnApp {
                         }
                         cx.notify();
                     }))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(if focused {
+                                theme::accent_hover()
+                            } else {
+                                theme::text_muted()
+                            })
+                            .child(">"),
+                    )
                     .child(text_content)
                     .when(!is_empty, |el| {
                         el.child(
@@ -1306,7 +1319,7 @@ impl LearnApp {
             .w_full()
             .min_w_0()
             .p_5()
-            .rounded_md()
+            .rounded_xs()
             .bg(theme::bg_card())
             .border_1()
             .border_color(theme::accent())
@@ -1350,7 +1363,7 @@ impl LearnApp {
                     .min_w_0()
                     .px_4()
                     .py_3()
-                    .rounded_md()
+                    .rounded_xs()
                     .bg(theme::rose_soft())
                     .border_1()
                     .border_color(theme::rose())
@@ -1367,7 +1380,7 @@ impl LearnApp {
                     .min_w_0()
                     .px_4()
                     .py_3()
-                    .rounded_md()
+                    .rounded_xs()
                     .bg(theme::emerald_soft())
                     .border_1()
                     .border_color(theme::emerald())
@@ -1398,7 +1411,7 @@ impl LearnApp {
             .w(px(450.0))
             .max_w_full()
             .p_7()
-            .rounded_md()
+            .rounded_xs()
             .bg(theme::bg_card())
             .border_1()
             .border_color(theme::border_subtle())
@@ -1461,7 +1474,7 @@ impl LearnApp {
                             .id("tab-signin")
                             .flex_1()
                             .py_2()
-                            .rounded_md()
+                            .rounded_xs()
                             .flex()
                             .justify_center()
                             .cursor_pointer()
@@ -1494,7 +1507,7 @@ impl LearnApp {
                             .id("tab-register")
                             .flex_1()
                             .py_2()
-                            .rounded_md()
+                            .rounded_xs()
                             .flex()
                             .justify_center()
                             .cursor_pointer()
@@ -1533,7 +1546,7 @@ impl LearnApp {
                         .id(("known-user", idx))
                         .px_3()
                         .py_1()
-                        .rounded_md()
+                        .rounded_xs()
                         .bg(theme::bg_input())
                         .border_1()
                         .border_color(theme::border_subtle())
@@ -1634,7 +1647,7 @@ impl LearnApp {
                     .mt_1()
                     .w_full()
                     .h(px(42.0))
-                    .rounded_md()
+                    .rounded_xs()
                     .bg(theme::accent())
                     .hover(|s| s.bg(theme::accent_hover()))
                     .cursor_pointer()
@@ -1745,7 +1758,7 @@ impl LearnApp {
                     .min_w_0()
                     .px_3()
                     .py_2()
-                    .rounded_md()
+                    .rounded_xs()
                     .cursor_pointer()
                     .bg(if is_selected {
                         theme::bg_card()
@@ -1868,7 +1881,7 @@ impl LearnApp {
                     .mt_2()
                     .child(nav_btn(
                         "nav-dashboard",
-                        "Topics & Dashboard",
+                        "01  TOPICS.INDEX",
                         Route::Dashboard,
                         self.route == Route::Dashboard,
                         cx,
@@ -1876,14 +1889,14 @@ impl LearnApp {
                     .when(self.active_topic_id.is_some(), |el| {
                         el.child(nav_btn(
                             "nav-quiz",
-                            "Live Quiz Arena",
+                            "02  QUIZ.ARENA",
                             Route::Quiz,
                             self.route == Route::Quiz,
                             cx,
                         ))
                         .child(nav_btn(
                             "nav-map",
-                            "Cognitive Mesh Map",
+                            "03  MESH.GRAPH",
                             Route::KnowledgeMap,
                             self.route == Route::KnowledgeMap,
                             cx,
@@ -1891,7 +1904,7 @@ impl LearnApp {
                     })
                     .child(nav_btn(
                         "nav-settings",
-                        "AI Runners & Settings",
+                        "04  AI.RUNNERS",
                         Route::Settings,
                         self.route == Route::Settings,
                         cx,
@@ -1927,7 +1940,7 @@ impl LearnApp {
                 .w_full()
                 .px_3()
                 .py_2()
-                .rounded_md()
+                .rounded_xs()
                 .border_1()
                 .border_color(theme::border_subtle())
                 .hover(|s| s.bg(theme::bg_card_hover()))
@@ -1954,7 +1967,7 @@ impl LearnApp {
                 .id(("level-pill", lvl as usize))
                 .px_3()
                 .py_1()
-                .rounded_md()
+                .rounded_xs()
                 .cursor_pointer()
                 .bg(if active {
                     theme::accent_soft()
@@ -2006,7 +2019,7 @@ impl LearnApp {
                 .w_full()
                 .min_w_0()
                 .p_6()
-                .rounded_md()
+                .rounded_xs()
                 .bg(theme::bg_card())
                 .border_1()
                 .border_color(theme::border_subtle())
@@ -2074,7 +2087,7 @@ impl LearnApp {
                                 .id("btn-start-topic")
                                 .px_5()
                                 .py_2()
-                                .rounded_md()
+                                .rounded_xs()
                                 .bg(theme::accent())
                                 .hover(|s| s.bg(theme::accent_hover()))
                                 .cursor_pointer()
@@ -2109,7 +2122,7 @@ impl LearnApp {
                     .w_full()
                     .min_w_0()
                     .p_6()
-                    .rounded_md()
+                    .rounded_xs()
                     .bg(theme::bg_card())
                     .border_1()
                     .border_color(theme::border_subtle())
@@ -2135,7 +2148,7 @@ impl LearnApp {
                         .w_full()
                         .min_w_0()
                         .p_5()
-                        .rounded_md()
+                        .rounded_xs()
                         .bg(theme::bg_card())
                         .border_1()
                         .border_color(theme::border_subtle())
@@ -2179,7 +2192,8 @@ impl LearnApp {
                                         .text_xs()
                                         .text_color(theme::emerald_text())
                                         .child(format!(
-                                            "{pct}% mastery · {}/{} mastered · streak {}",
+                                            "{} {pct}% · {}/{} · STRK {}",
+                                            theme::ascii_bar(topic.average_mastery, 10),
                                             topic.mastered_count,
                                             topic.concept_count,
                                             topic.current_streak
@@ -2229,7 +2243,7 @@ impl LearnApp {
                                                 .id(("topic-continue", idx))
                                                 .px_3()
                                                 .py_1()
-                                                .rounded_md()
+                                                .rounded_xs()
                                                 .bg(theme::accent())
                                                 .hover(|s| s.bg(theme::accent_hover()))
                                                 .cursor_pointer()
@@ -2248,7 +2262,7 @@ impl LearnApp {
                                                 .id(("topic-map", idx))
                                                 .px_3()
                                                 .py_1()
-                                                .rounded_md()
+                                                .rounded_xs()
                                                 .bg(theme::bg_input())
                                                 .border_1()
                                                 .border_color(theme::border_subtle())
@@ -2268,7 +2282,7 @@ impl LearnApp {
                                                 .id(("topic-del", idx))
                                                 .px_2()
                                                 .py_1()
-                                                .rounded_md()
+                                                .rounded_xs()
                                                 .hover(|s| s.bg(theme::rose_soft()))
                                                 .cursor_pointer()
                                                 .text_xs()
@@ -2349,7 +2363,7 @@ impl LearnApp {
                     .w_full()
                     .min_w_0()
                     .p_4()
-                    .rounded_lg()
+                    .rounded_xs()
                     .bg(theme::bg_input())
                     .border_1()
                     .border_color(theme::border_subtle())
@@ -2397,7 +2411,7 @@ impl LearnApp {
                         div()
                             .px_3()
                             .py_2()
-                            .rounded_md()
+                            .rounded_xs()
                             .bg(theme::bg_card())
                             .border_1()
                             .border_color(theme::border_subtle())
@@ -2426,7 +2440,7 @@ impl LearnApp {
                     .w_full()
                     .min_w_0()
                     .p_4()
-                    .rounded_lg()
+                    .rounded_xs()
                     .bg(theme::bg_input())
                     .border_1()
                     .border_color(theme::border_subtle())
@@ -2467,7 +2481,7 @@ impl LearnApp {
                         .flex_1()
                         .min_w(px(220.0))
                         .p_3()
-                        .rounded_md()
+                        .rounded_xs()
                         .bg(theme::bg_card())
                         .border_1()
                         .border_color(theme::border_subtle())
@@ -2498,7 +2512,7 @@ impl LearnApp {
                     .w_full()
                     .min_w_0()
                     .p_4()
-                    .rounded_lg()
+                    .rounded_xs()
                     .bg(theme::bg_input())
                     .border_1()
                     .border_color(theme::border_subtle())
@@ -2562,7 +2576,7 @@ impl LearnApp {
                     .w_full()
                     .min_w_0()
                     .p_4()
-                    .rounded_md()
+                    .rounded_xs()
                     .bg(theme::bg_input())
                     .border_1()
                     .border_color(theme::accent())
@@ -2742,7 +2756,7 @@ impl LearnApp {
                     .w_full()
                     .min_w_0()
                     .p_4()
-                    .rounded_lg()
+                    .rounded_xs()
                     .bg(theme::bg_input())
                     .border_1()
                     .border_color(theme::accent())
@@ -2782,7 +2796,7 @@ impl LearnApp {
                             .flex_shrink_0()
                             .px_3()
                             .py_2()
-                            .rounded_md()
+                            .rounded_xs()
                             .bg(theme::accent())
                             .hover(|s| s.bg(theme::accent_hover()))
                             .cursor_pointer()
@@ -2922,7 +2936,7 @@ impl LearnApp {
                         .flex_shrink_0()
                         .px_3()
                         .py_1p5()
-                        .rounded_md()
+                        .rounded_xs()
                         .bg(theme::bg_card())
                         .border_1()
                         .border_color(theme::border_subtle())
@@ -2952,7 +2966,7 @@ impl LearnApp {
                     .w_full()
                     .min_w_0()
                     .p_6()
-                    .rounded_md()
+                    .rounded_xs()
                     .bg(theme::bg_card())
                     .text_sm()
                     .text_color(theme::text_secondary())
@@ -2983,7 +2997,7 @@ impl LearnApp {
             .w_full()
             .min_w_0()
             .p_6()
-            .rounded_md()
+            .rounded_xs()
             .bg(theme::bg_card())
             .border_1()
             .border_color(theme::border_subtle())
@@ -3042,7 +3056,7 @@ impl LearnApp {
                         .min_w_0()
                         .px_3p5()
                         .py_2p5()
-                        .rounded_md()
+                        .rounded_xs()
                         .bg(theme::bg_input())
                         .border_l_2()
                         .border_color(theme::accent())
@@ -3054,7 +3068,7 @@ impl LearnApp {
                                 .text_xs()
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(theme::accent_text())
-                                .child("Goal & Context"),
+                                .child("// GOAL & CONTEXT"),
                         )
                         .child(
                             div()
@@ -3165,7 +3179,7 @@ impl LearnApp {
                     .min_w_0()
                     .px_3p5()
                     .py_2p5()
-                    .rounded_md()
+                    .rounded_xs()
                     .bg(theme::amber_soft())
                     .border_1()
                     .border_color(theme::amber())
@@ -3202,7 +3216,7 @@ impl LearnApp {
                     .w_full()
                     .min_w_0()
                     .p_4()
-                    .rounded_lg()
+                    .rounded_xs()
                     .bg(bg)
                     .border_1()
                     .border_color(border)
@@ -3218,18 +3232,24 @@ impl LearnApp {
                     }))
                     .child(
                         div()
-                            .w(px(28.0))
-                            .h(px(28.0))
+                            .px_2()
+                            .h(px(26.0))
                             .flex_shrink_0()
-                            .rounded_md()
+                            .rounded_xs()
                             .bg(badge_bg)
+                            .border_1()
+                            .border_color(if is_picked || answered {
+                                border
+                            } else {
+                                theme::border_subtle()
+                            })
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_xs()
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(badge_fg)
-                            .child(choice.id.clone()),
+                            .child(format!("[{}]", choice.id)),
                     )
                     .child(
                         div()
@@ -3271,7 +3291,7 @@ impl LearnApp {
                                         .id("btn-show-hint")
                                         .px_3()
                                         .py_1p5()
-                                        .rounded_md()
+                                        .rounded_xs()
                                         .bg(theme::bg_input())
                                         .border_1()
                                         .border_color(theme::border_subtle())
@@ -3308,7 +3328,7 @@ impl LearnApp {
                                     .id("btn-submit-guess")
                                     .px_4()
                                     .py_2()
-                                    .rounded_md()
+                                    .rounded_xs()
                                     .bg(if has_pick {
                                         theme::amber_soft()
                                     } else {
@@ -3343,7 +3363,7 @@ impl LearnApp {
                                     .id("btn-submit-sure")
                                     .px_4()
                                     .py_2()
-                                    .rounded_md()
+                                    .rounded_xs()
                                     .bg(if has_pick {
                                         theme::accent()
                                     } else {
@@ -3398,7 +3418,7 @@ impl LearnApp {
                 .w_full()
                 .min_w_0()
                 .p_5()
-                .rounded_md()
+                .rounded_xs()
                 .bg(fb_bg)
                 .border_1()
                 .border_color(fb_border)
@@ -3457,7 +3477,7 @@ impl LearnApp {
                                 .min_w_0()
                                 .px_3()
                                 .py_2()
-                                .rounded_md()
+                                .rounded_xs()
                                 .bg(theme::bg_input())
                                 .border_1()
                                 .border_color(theme::rose())
@@ -3493,7 +3513,7 @@ impl LearnApp {
                     .w_full()
                     .min_w_0()
                     .p_3()
-                    .rounded_md()
+                    .rounded_xs()
                     .bg(theme::bg_input())
                     .border_1()
                     .border_color(theme::border_subtle())
@@ -3530,7 +3550,7 @@ impl LearnApp {
                             .id("btn-next-question")
                             .px_5()
                             .py_2()
-                            .rounded_md()
+                            .rounded_xs()
                             .bg(theme::accent())
                             .hover(|s| s.bg(theme::accent_hover()))
                             .cursor_pointer()
@@ -3552,7 +3572,7 @@ impl LearnApp {
             .w_full()
             .min_w_0()
             .p_5()
-            .rounded_md()
+            .rounded_xs()
             .bg(theme::bg_card())
             .border_1()
             .border_color(theme::border_subtle())
@@ -3585,7 +3605,7 @@ impl LearnApp {
                     .w_full()
                     .min_w_0()
                     .p_3p5()
-                    .rounded_lg()
+                    .rounded_xs()
                     .bg(theme::bg_input())
                     .border_1()
                     .border_color(theme::border_subtle())
@@ -3674,7 +3694,7 @@ impl LearnApp {
                         .flex_shrink_0()
                         .h(px(40.0))
                         .px_4()
-                        .rounded_md()
+                        .rounded_xs()
                         .bg(theme::accent())
                         .hover(|s| s.bg(theme::accent_hover()))
                         .cursor_pointer()
@@ -3732,7 +3752,7 @@ impl LearnApp {
                 .flex_1()
                 .min_w(px(105.0))
                 .p_3()
-                .rounded_lg()
+                .rounded_xs()
                 .bg(theme::bg_card())
                 .border_1()
                 .border_color(theme::border_subtle())
@@ -3803,7 +3823,7 @@ impl LearnApp {
                                     .id("btn-expand-map")
                                     .px_3()
                                     .py_2()
-                                    .rounded_md()
+                                    .rounded_xs()
                                     .bg(theme::bg_card())
                                     .border_1()
                                     .border_color(theme::border_subtle())
@@ -3821,7 +3841,7 @@ impl LearnApp {
                                     .id("btn-map-quiz")
                                     .px_4()
                                     .py_2()
-                                    .rounded_md()
+                                    .rounded_xs()
                                     .bg(theme::accent())
                                     .hover(|s| s.bg(theme::accent_hover()))
                                     .cursor_pointer()
@@ -3862,7 +3882,7 @@ impl LearnApp {
                 .w_full()
                 .min_w_0()
                 .p_5()
-                .rounded_md()
+                .rounded_xs()
                 .bg(theme::bg_card())
                 .border_1()
                 .border_color(theme::border_subtle())
@@ -3892,7 +3912,7 @@ impl LearnApp {
                             .min_w_0()
                             .px_3()
                             .py_2()
-                            .rounded_md()
+                            .rounded_xs()
                             .bg(theme::amber_soft())
                             .text_xs()
                             .text_color(theme::amber_text())
@@ -3922,7 +3942,7 @@ impl LearnApp {
                             .min_w_0()
                             .px_3()
                             .py_2()
-                            .rounded_md()
+                            .rounded_xs()
                             .bg(theme::rose_soft())
                             .text_xs()
                             .text_color(theme::rose_text())
@@ -3953,7 +3973,7 @@ impl LearnApp {
                             .min_w_0()
                             .px_3()
                             .py_2()
-                            .rounded_md()
+                            .rounded_xs()
                             .bg(theme::bg_input())
                             .border_1()
                             .border_color(theme::amber())
@@ -3980,7 +4000,7 @@ impl LearnApp {
                             .min_w_0()
                             .px_3()
                             .py_2()
-                            .rounded_md()
+                            .rounded_xs()
                             .bg(theme::emerald_soft())
                             .text_xs()
                             .text_color(theme::emerald_text())
@@ -4030,7 +4050,7 @@ impl LearnApp {
                     .w_full()
                     .min_w_0()
                     .p_4()
-                    .rounded_lg()
+                    .rounded_xs()
                     .bg(theme::bg_card())
                     .border_1()
                     .border_color(theme::border_subtle())
@@ -4140,7 +4160,7 @@ impl LearnApp {
                             .min_w_0()
                             .px_3()
                             .py_2()
-                            .rounded_md()
+                            .rounded_xs()
                             .bg(theme::amber_soft())
                             .text_xs()
                             .text_color(theme::amber_text())
@@ -4228,7 +4248,7 @@ impl LearnApp {
                         .flex_shrink_0()
                         .px_3()
                         .py_1p5()
-                        .rounded_md()
+                        .rounded_xs()
                         .bg(theme::bg_card())
                         .border_1()
                         .border_color(theme::border_subtle())
@@ -4267,7 +4287,7 @@ impl LearnApp {
                     .w_full()
                     .min_w_0()
                     .p_4()
-                    .rounded_lg()
+                    .rounded_xs()
                     .bg(if active {
                         theme::accent_soft()
                     } else {
@@ -4369,7 +4389,7 @@ impl LearnApp {
                 .w_full()
                 .min_w_0()
                 .p_5()
-                .rounded_md()
+                .rounded_xs()
                 .bg(theme::bg_card())
                 .border_1()
                 .border_color(theme::border_subtle())
@@ -4410,7 +4430,7 @@ impl LearnApp {
                                 .id("btn-save-keys")
                                 .px_4()
                                 .py_2()
-                                .rounded_md()
+                                .rounded_xs()
                                 .bg(theme::accent())
                                 .hover(|s| s.bg(theme::accent_hover()))
                                 .cursor_pointer()
@@ -4427,11 +4447,129 @@ impl LearnApp {
 
         container
     }
+    fn render_terminal_topbar(&self, user: Option<&User>) -> AnyElement {
+        let route_path = match (&self.user, self.route) {
+            (None, _) => "~/learn/auth",
+            (Some(_), Route::Dashboard) => "~/learn/topics",
+            (Some(_), Route::Quiz) => "~/learn/quiz-arena",
+            (Some(_), Route::KnowledgeMap) => "~/learn/cognitive-mesh",
+            (Some(_), Route::Settings) => "~/learn/runners",
+        };
+        let right_status = match user {
+            Some(u) => format!(
+                "OP:{}  |  AI:{}  |  BUF:{}/{}",
+                u.username,
+                u.runner.as_str(),
+                self.buffered_ready,
+                DEFAULT_BUFFER_TARGET
+            ),
+            None => "MODE:LOCAL  |  DB:SQLITE.WAL".to_string(),
+        };
+
+        div()
+            .w_full()
+            .h(px(30.0))
+            .flex_shrink_0()
+            .px_4()
+            .bg(theme::bg_sidebar())
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .size(px(6.0))
+                            .rounded_full()
+                            .bg(if self.is_ai_active() {
+                                theme::accent_hover()
+                            } else {
+                                theme::pure_white()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(route_path),
+                    )
+                    .when(self.is_ai_active(), |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::accent_text())
+                                .child("[BUSY]"),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::text_muted())
+                    .child(right_status),
+            )
+            .into_any_element()
+    }
+
+    fn render_terminal_footer(&self) -> AnyElement {
+        let hints = if self.user.is_none() {
+            "[TAB] SWITCH FIELD   [CMD+A] SELECT ALL   [CMD+BKSP] CLEAR   [RET] SIGN IN   [CMD+W] EXIT"
+        } else {
+            match self.route {
+                Route::Quiz => {
+                    "[1-4 / A-D] PICK   [H] HINT   [G] GUESS   [RET] SURE / NEXT   [CMD+W] EXIT"
+                }
+                Route::Dashboard => {
+                    "[RET] START TOPIC   [CMD+A] SELECT ALL   [CMD+BKSP] CLEAR   [CMD+W] EXIT"
+                }
+                Route::KnowledgeMap => {
+                    "[MESH] μ MASTERY ± σ UNCERTAINTY · S STABILITY   [CMD+W] EXIT"
+                }
+                Route::Settings => {
+                    "[CMD+V] PASTE KEY   [RET] SAVE KEYS   [CMD+W] EXIT"
+                }
+            }
+        };
+
+        div()
+            .w_full()
+            .h(px(26.0))
+            .flex_shrink_0()
+            .px_4()
+            .bg(theme::bg_sidebar())
+            .border_t_1()
+            .border_color(theme::border_subtle())
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::text_muted())
+                    .child(hints),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::accent_text())
+                    .child("LEARN // TUI-NATIVE"),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for LearnApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let content: AnyElement = if let Some(user) = self.user.clone() {
+        let user_opt = self.user.clone();
+        let content: AnyElement = if let Some(user) = user_opt.clone() {
             let main_view: AnyElement = match self.route {
                 Route::Dashboard => self.render_dashboard(&user, cx).into_any_element(),
                 Route::Quiz => self.render_quiz(cx).into_any_element(),
@@ -4440,7 +4578,9 @@ impl Render for LearnApp {
             };
 
             div()
-                .size_full()
+                .flex_1()
+                .min_h_0()
+                .w_full()
                 .overflow_hidden()
                 .flex()
                 .bg(theme::bg_canvas())
@@ -4455,11 +4595,18 @@ impl Render for LearnApp {
                 )
                 .into_any_element()
         } else {
-            self.render_auth(cx).into_any_element()
+            div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .overflow_hidden()
+                .child(self.render_auth(cx))
+                .into_any_element()
         };
 
         div()
             .id("learn-root")
+            .font_family(theme::mono_font())
             .track_focus(&self.focus_handle)
             .on_action(|_: &CloseWindow, window, _| {
                 window.remove_window();
@@ -4468,11 +4615,15 @@ impl Render for LearnApp {
                 cx.quit();
             })
             .size_full()
+            .flex()
+            .flex_col()
             .overflow_hidden()
             .bg(theme::bg_canvas())
             .text_color(theme::text_primary())
             .on_key_down(cx.listener(Self::handle_key_down))
+            .child(self.render_terminal_topbar(user_opt.as_ref()))
             .child(content)
+            .child(self.render_terminal_footer())
     }
 }
 
