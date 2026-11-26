@@ -1,5 +1,6 @@
+use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, AsyncApp, ClickEvent, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent,
@@ -9,7 +10,7 @@ use learn_core::{
     AnswerConfidence, AnswerResult, AudioDemoSpec, ClarifyingReply, ConceptNode, ConceptStatus,
     DEFAULT_BUFFER_TARGET, DEFAULT_OPEN_QUEUE_TARGET, DetectedRunner, EdgeKind, ExampleMedia,
     KnowledgeMap, LearnService, MediaReveal, QuestionIntent, RunnerKind, SkillLevel,
-    StoredQuestion, TopicSummary, User, synthesize_audio_wav,
+    StoredQuestion, TopicSummary, User, synthesize_audio_wav_bars,
 };
 
 use crate::text_buffer::TextBuffer;
@@ -64,10 +65,17 @@ pub struct LearnApp {
     hint_revealed: bool,
     last_answer: Option<AnswerResult>,
 
-    // Audio preview playback & on-demand supporting example generation
+    // Audio preview playback, looping, & realtime step playhead
     audio_child: Option<Child>,
     audio_status: Option<String>,
     audio_showing_after: bool,
+    audio_looping: bool,
+    audio_wav_path: Option<PathBuf>,
+    audio_started_at: Option<Instant>,
+    audio_bpm: f32,
+    audio_steps_per_bar: usize,
+    audio_active_step: Option<usize>,
+    audio_playhead_running: bool,
     media_busy: bool,
 
     // Live UI feedback
@@ -141,6 +149,13 @@ impl LearnApp {
             audio_child: None,
             audio_status: None,
             audio_showing_after: false,
+            audio_looping: true,
+            audio_wav_path: None,
+            audio_started_at: None,
+            audio_bpm: 128.0,
+            audio_steps_per_bar: 4,
+            audio_active_step: None,
+            audio_playhead_running: false,
             media_busy: false,
             busy_message: None,
             prefetching: false,
@@ -499,6 +514,75 @@ impl LearnApp {
         }
         self.audio_status = None;
         self.audio_showing_after = false;
+        self.audio_started_at = None;
+        self.audio_active_step = None;
+        self.audio_wav_path = None;
+    }
+
+    fn ensure_audio_playhead_loop(&mut self, cx: &mut Context<Self>) {
+        if self.audio_playhead_running || self.audio_child.is_none() {
+            return;
+        }
+        self.audio_playhead_running = true;
+
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(33))
+                    .await;
+
+                let mut keep_running = false;
+                let updated = this.update(cx, |view, cx| {
+                    let exited = match view.audio_child.as_mut() {
+                        Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+                        None => true,
+                    };
+
+                    if exited {
+                        if view.audio_looping {
+                            if let Some(wav) = view.audio_wav_path.clone() {
+                                if let Ok(child) = Command::new("afplay").arg(&wav).spawn() {
+                                    view.audio_child = Some(child);
+                                    view.audio_started_at = Some(Instant::now());
+                                    view.audio_active_step = Some(0);
+                                    keep_running = true;
+                                    cx.notify();
+                                    return;
+                                }
+                            }
+                        }
+                        view.audio_child = None;
+                        view.audio_started_at = None;
+                        view.audio_active_step = None;
+                        view.audio_status = None;
+                        view.audio_playhead_running = false;
+                        cx.notify();
+                        return;
+                    }
+
+                    if let Some(started) = view.audio_started_at {
+                        let bpm = view.audio_bpm.clamp(70.0, 170.0);
+                        let steps = view.audio_steps_per_bar.max(1);
+                        let bar_sec = (60.0 / bpm) * 4.0;
+                        let step_sec = bar_sec / (steps as f32);
+                        let step_idx =
+                            ((started.elapsed().as_secs_f32() / step_sec).floor() as usize) % steps;
+                        if view.audio_active_step != Some(step_idx) {
+                            view.audio_active_step = Some(step_idx);
+                            cx.notify();
+                        }
+                        keep_running = true;
+                    } else {
+                        view.audio_playhead_running = false;
+                    }
+                });
+
+                if updated.is_err() || !keep_running {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn generate_supporting_example(&mut self, cx: &mut Context<Self>) {
@@ -557,13 +641,36 @@ impl LearnApp {
         self.stop_audio_quiet();
         let tag = if dry_before { "before" } else { "after" };
         let wav_path = std::env::temp_dir().join(format!("learn-demo-{tag}.wav"));
-        match synthesize_audio_wav(&spec, dry_before, &wav_path) {
+        // Synthesize 16 sample-accurate seamless bars when looping, or 2 bars for one-shot playback
+        let bars = if self.audio_looping { 16 } else { 2 };
+        let active_levels = if !dry_before && !spec.after_step_levels.is_empty() {
+            &spec.after_step_levels
+        } else {
+            &spec.step_levels
+        };
+        let steps_per_bar = match active_levels.len() {
+            4 => 4,
+            8 => 8,
+            _ => 16,
+        };
+
+        match synthesize_audio_wav_bars(&spec, dry_before, bars, &wav_path) {
             Ok(path) => match Command::new("afplay").arg(&path).spawn() {
                 Ok(child) => {
                     self.audio_child = Some(child);
+                    self.audio_wav_path = Some(path);
                     self.audio_showing_after = !dry_before;
-                    self.audio_status = Some(format!("Playing: {label}"));
+                    self.audio_bpm = spec.bpm.clamp(70.0, 170.0);
+                    self.audio_steps_per_bar = steps_per_bar;
+                    self.audio_started_at = Some(Instant::now());
+                    self.audio_active_step = Some(0);
+                    self.audio_status = Some(format!(
+                        "{}: {}",
+                        if self.audio_looping { "LOOPING" } else { "PLAYING" },
+                        label
+                    ));
                     self.error_banner = None;
+                    self.ensure_audio_playhead_loop(cx);
                 }
                 Err(err) => {
                     self.error_banner = Some(format!("Audio playback unavailable (`afplay`): {err}"));
@@ -2573,11 +2680,18 @@ impl LearnApp {
                 // Show Target Result button after answering so before-answer audio is crystal-clear & non-confusing
                 let show_after_btn = self.last_answer.is_some();
 
+                let fallback_levels: Vec<f32> = if spec.step_levels.is_empty() {
+                    vec![0.85, 0.35, 0.55, 0.45, 0.85, 0.35, 0.55, 0.45]
+                } else {
+                    Vec::new()
+                };
                 let displayed_levels: &[f32] =
                     if self.audio_showing_after && !spec.after_step_levels.is_empty() {
                         &spec.after_step_levels
-                    } else {
+                    } else if !spec.step_levels.is_empty() {
                         &spec.step_levels
+                    } else {
+                        &fallback_levels
                     };
                 let view_tag = if self.audio_showing_after && !spec.after_step_levels.is_empty() {
                     format!("SHOWING: {after_lbl}")
@@ -2623,7 +2737,7 @@ impl LearnApp {
                             }),
                     );
 
-                // High-contrast, live-synced drum-machine step meter (tall bars + % readout + red peak highlight)
+                // High-contrast, live-synced drum-machine step meter + realtime playhead LED row
                 if !displayed_levels.is_empty() {
                     let max_v = displayed_levels
                         .iter()
@@ -2635,19 +2749,22 @@ impl LearnApp {
                         .copied()
                         .fold(1.0f32, f32::min);
                     let has_contrast = (max_v - min_v) >= 0.12;
+                    let active_step = self
+                        .audio_active_step
+                        .map(|s| s % displayed_levels.len().max(1));
 
                     let mut bars = div()
                         .w_full()
-                        .h(px(108.0))
+                        .h(px(124.0))
                         .flex()
                         .items_end()
                         .gap_2()
                         .pt_2();
                     for (i, val) in displayed_levels.iter().enumerate() {
                         let raw_v = val.clamp(0.0, 1.0);
-                        // Scale bar height clearly between 10px and 72px so differences jump off the screen
                         let scaled_h = (raw_v / max_v).clamp(0.14, 1.0) * 72.0;
                         let is_peak = has_contrast && raw_v >= max_v - 0.05;
+                        let is_playing_now = active_step == Some(i);
                         let pct = (raw_v * 100.0).round() as u32;
                         let lbl = spec
                             .step_labels
@@ -2655,12 +2772,34 @@ impl LearnApp {
                             .cloned()
                             .unwrap_or_else(|| format!("{}", i + 1));
 
+                        let bar_bg = if is_playing_now {
+                            theme::accent_hover()
+                        } else if is_peak {
+                            theme::accent()
+                        } else {
+                            theme::emerald()
+                        };
+
                         bars = bars.child(
                             div()
                                 .flex_1()
                                 .max_w(px(68.0))
                                 .min_w(px(18.0))
                                 .h_full()
+                                .px_1()
+                                .py_1()
+                                .rounded_xs()
+                                .bg(if is_playing_now {
+                                    theme::accent_soft()
+                                } else {
+                                    theme::transparent()
+                                })
+                                .border_1()
+                                .border_color(if is_playing_now {
+                                    theme::accent_hover()
+                                } else {
+                                    theme::transparent()
+                                })
                                 .flex()
                                 .flex_col()
                                 .justify_end()
@@ -2669,7 +2808,9 @@ impl LearnApp {
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(if is_peak {
+                                        .text_color(if is_playing_now {
+                                            theme::pure_white()
+                                        } else if is_peak {
                                             theme::accent_text()
                                         } else {
                                             theme::text_muted()
@@ -2681,26 +2822,34 @@ impl LearnApp {
                                         .w_full()
                                         .h(px(scaled_h))
                                         .rounded_t_xs()
-                                        .bg(if is_peak {
-                                            theme::accent()
-                                        } else {
-                                            theme::emerald()
-                                        }),
+                                        .bg(bar_bg),
                                 )
                                 .child(
                                     div()
                                         .text_xs()
-                                        .font_weight(if is_peak {
+                                        .font_weight(if is_playing_now || is_peak {
                                             gpui::FontWeight::BOLD
                                         } else {
                                             gpui::FontWeight::NORMAL
                                         })
-                                        .text_color(if is_peak {
+                                        .text_color(if is_playing_now || is_peak {
                                             theme::text_primary()
                                         } else {
                                             theme::text_muted()
                                         })
                                         .child(lbl),
+                                )
+                                // Hardware sequencer step LED under each column
+                                .child(
+                                    div()
+                                        .w(px(14.0))
+                                        .h(px(3.0))
+                                        .rounded_xs()
+                                        .bg(if is_playing_now {
+                                            theme::accent_hover()
+                                        } else {
+                                            theme::border_subtle()
+                                        }),
                                 ),
                         );
                     }
@@ -2770,6 +2919,40 @@ impl LearnApp {
                                     .child(format!("▶ {after_lbl}")),
                             )
                         })
+                        .child(
+                            div()
+                                .id("btn-audio-loop-toggle")
+                                .px_3()
+                                .py_1p5()
+                                .rounded_xs()
+                                .bg(if self.audio_looping {
+                                    theme::accent_soft()
+                                } else {
+                                    theme::bg_card()
+                                })
+                                .border_1()
+                                .border_color(if self.audio_looping {
+                                    theme::accent()
+                                } else {
+                                    theme::border_subtle()
+                                })
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(if self.audio_looping {
+                                    theme::accent_text()
+                                } else {
+                                    theme::text_muted()
+                                })
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.audio_looping = !this.audio_looping;
+                                    cx.notify();
+                                }))
+                                .child(if self.audio_looping {
+                                    "[LOOP: ON]"
+                                } else {
+                                    "[LOOP: OFF]"
+                                }),
+                        )
                         .when(self.audio_child.is_some(), |el| {
                             el.child(
                                 div()

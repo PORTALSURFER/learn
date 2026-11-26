@@ -8,13 +8,22 @@ use crate::models::AudioDemoSpec;
 const SAMPLE_RATE: u32 = 44_100;
 
 /// Synthesizes a clean 2-bar procedural audio preview (16-bit mono PCM `.wav`) in pure Rust.
-/// Supports 4 versatile voices: `"synth"`, `"rim_click"`, `"kick_bass"`, and `"delay"`.
-/// When `dry_before` is true, renders the starting/unprocessed "Before" reference so the learner
-/// can A/B hear the difference directly.
 pub fn synthesize_audio_wav(spec: &AudioDemoSpec, dry_before: bool, out_path: &Path) -> Result<PathBuf> {
+    synthesize_audio_wav_bars(spec, dry_before, 2, out_path)
+}
+
+/// Synthesizes an exact `total_bars`-long sample-accurate procedural `.wav` (e.g. 16 bars for
+/// gapless looped playback, or 2 bars for a single preview pass).
+pub fn synthesize_audio_wav_bars(
+    spec: &AudioDemoSpec,
+    dry_before: bool,
+    total_bars: usize,
+    out_path: &Path,
+) -> Result<PathBuf> {
     let bpm = spec.bpm.clamp(70.0, 170.0);
     let base_hz = spec.base_hz.clamp(45.0, 880.0);
     let voice = spec.voice.trim().to_lowercase();
+    let total_bars = total_bars.clamp(1, 32);
 
     let active_levels: &[f32] = if !dry_before && !spec.after_step_levels.is_empty() {
         &spec.after_step_levels
@@ -22,7 +31,7 @@ pub fn synthesize_audio_wav(spec: &AudioDemoSpec, dry_before: bool, out_path: &P
         &spec.step_levels
     };
 
-    // If the AI gave a 4-beat or 8-step pattern, map cleanly onto 2 bars; default to 16th-note grid.
+    // Match the exact step grid shown visually in the UI (4, 8, or 16 steps per bar).
     let steps_per_bar = match active_levels.len() {
         4 => 4usize,
         8 => 8usize,
@@ -30,7 +39,6 @@ pub fn synthesize_audio_wav(spec: &AudioDemoSpec, dry_before: bool, out_path: &P
     };
     let bar_sec = (60.0 / bpm) * 4.0;
     let step_sec = bar_sec / (steps_per_bar as f32);
-    let total_bars = 2usize;
     let total_samples = ((total_bars as f32) * bar_sec * (SAMPLE_RATE as f32)) as usize;
     let mut samples = vec![0.0f32; total_samples];
 
@@ -163,9 +171,10 @@ pub fn synthesize_audio_wav(spec: &AudioDemoSpec, dry_before: bool, out_path: &P
                 spec.cutoff_end_hz.clamp(120.0, 14_000.0)
             };
 
+            let cycle_samples = ((2.0 * bar_sec * SAMPLE_RATE as f32) as usize).max(1);
             for i in 0..total_samples {
                 let t = i as f32 / SAMPLE_RATE as f32;
-                let progress = i as f32 / total_samples.max(1) as f32;
+                let progress = (i % cycle_samples) as f32 / (cycle_samples as f32);
                 let step_f = t / sixteenth_sec;
                 let step_idx = (step_f as usize) % 16;
                 let step_pos = step_f.fract();
