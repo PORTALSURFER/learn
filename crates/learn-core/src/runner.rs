@@ -860,21 +860,26 @@ pub fn build_question_prompt(directive: &SchedulerDirective) -> String {
             crate::models::ConceptStatus::Unseen | crate::models::ConceptStatus::NeedsReview
         );
 
-    lines.push("Pedagogical & Anti-Confusion Rules (CRITICAL):".into());
+    lines.push("Pedagogical & Authenticity Rules (CRITICAL):".into());
     lines.push(format!(
-        "- DISCIPLINE FIDELITY (CRITICAL): Stay 100% faithful to the target concept's actual pillar (`{}`) and subject matter. NEVER distort the concept into an unrelated sub-skill or force it into a narrow template just to reuse a media format.",
+        "- MATCH THE SOUL OF THE CRAFT (CRITICAL): Think like a passionate master practitioner of \"{}\", NOT a sterile standardized-test writer! Adapt your tone and reasoning style to the nature of the subject: if the topic is creative, artistic, sensory, experiential, or craft-driven, ground the scenario in emotion, feel, perceptual impact, artistic intent, and lived real-world decisions (while remaining rigorous and exact for inherently quantitative fields).",
+        directive.compressed_context.topic_title
+    ));
+    lines.push("- NO ARTIFICIAL MATH OR COUNTING RIDDLES (CRITICAL): NEVER turn a conceptual, creative, perceptual, or strategic topic into a schoolroom arithmetic word problem (like subtracting indices, counting slots, or guessing arbitrary numbers) unless calculation is genuinely the core skill of this specific concept. Test real intuition, cause-and-effect, taste, and practical judgment!".into());
+    lines.push(format!(
+        "- DISCIPLINE FIDELITY: Stay 100% faithful to the target concept's actual pillar (`{}`) and subject matter. NEVER distort the concept into an unrelated sub-skill or force it into a narrow template just to reuse a media format.",
         directive.concept.subtopic
     ));
-    lines.push("- Write in crystal-clear, concrete, everyday language matched to the learner's level. Briefly define any domain jargon inline.".into());
-    lines.push("- `goal`: 1 crisp plain-English sentence explaining the HUMAN, PERCEPTUAL, or PRACTICAL WHY first—why a real practitioner cares about this concept in the first place.".into());
+    lines.push("- Write in vivid, natural, everyday language matched to the learner's level. Briefly define any domain jargon inline.".into());
+    lines.push("- `goal`: 1 evocative, plain-English sentence explaining the HUMAN, EMOTIONAL, PERCEPTUAL, or PRACTICAL WHY first—what a real practitioner is trying to make the audience, user, or result FEEL or DO.".into());
     if needs_primer {
-        lines.push("- `primer`: REQUIRED here (learner is new to or struggling with this concept). Write 1-2 short, intuitive sentences TEACHING the core mental model and cause-and-effect principle BEFORE the question, without spoiling the exact answer letter.".into());
+        lines.push("- `primer`: REQUIRED here (learner is new to or struggling with this concept). Write 1-2 short, intuitive sentences TEACHING the core mental model and felt cause-and-effect principle BEFORE the question, without spoiling the exact answer letter.".into());
     } else {
         lines.push("- `primer`: Return empty string \"\" since the learner already has solid mastery and should recall unassisted.".into());
     }
-    lines.push("- `prompt`: Keep it effortless to grok on the FIRST read! State ONE clean starting setup + ONE clear question. NEVER include decoy backstories that confuse what the learner is deciding or modifying.".into());
-    lines.push("- EXPLICIT CONSTRAINT RULE (zero ambiguity): Every single constraint used to reject ANY distractor MUST be stated explicitly inside `prompt`. Never penalize an option for breaking an unmentioned constraint!".into());
-    lines.push("- CHOICES: Keep each of the 4 choices SHORT (<= 14 words), concrete, and parallel in structure, varying ONE clear dimension at a time. Exactly 1 unambiguously right answer and 3 clearly distinct distractors (never 'All of the above').".into());
+    lines.push("- `prompt`: Keep it effortless to grok on the FIRST read! State ONE vivid, authentic starting situation + ONE clear practical/creative decision. NEVER include confusing decoy backstories.".into());
+    lines.push("- CLEAR INTENT RULE (zero ambiguity): If a specific goal or constraint rules out an alternative, state that intent naturally inside `prompt` so no option is ever penalized for breaking an unmentioned rule.".into());
+    lines.push("- CHOICES: Keep each of the 4 choices SHORT (<= 14 words), concrete, and parallel in structure—representing 4 distinct real-world practitioner moves or judgments (NOT four arbitrary numbers unless the concept is inherently numerical). Exactly 1 clearly best answer and 3 realistic distractors (never 'All of the above').".into());
     lines.push("- `hint`: 1 crisp sentence nudging the learner toward the mental model WITHOUT revealing the correct choice.".into());
     lines.push("- `media`: Choose whichever supporting example modality (`reveal: \"before_answer\"` by default) genuinely makes THIS specific concept clearest—without spoiling which option A-D is right:".into());
     lines.push("  * `curve`: 4-16 normalized values (0.0..1.0 with clear visual contrast) + concise labels — ideal for profiles, curves, envelopes, distributions, responses, or sequential intensities.".into());
