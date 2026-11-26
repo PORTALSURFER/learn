@@ -1,4 +1,5 @@
 mod app;
+mod text_buffer;
 mod theme;
 
 use gpui::{

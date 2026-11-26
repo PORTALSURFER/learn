@@ -1,6 +1,6 @@
 use gpui::{
-    AnyElement, AsyncApp, ClickEvent, Context, FocusHandle, Focusable, KeyDownEvent, SharedString,
-    WeakEntity, Window, div, prelude::*, px,
+    AnyElement, AsyncApp, ClickEvent, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent,
+    SharedString, WeakEntity, Window, div, prelude::*, px,
 };
 use learn_core::{
     AnswerResult, ClarifyingReply, ConceptNode, ConceptStatus, DEFAULT_BUFFER_TARGET,
@@ -8,6 +8,7 @@ use learn_core::{
     QuestionIntent, RunnerKind, SkillLevel, StoredQuestion, TopicSummary, User,
 };
 
+use crate::text_buffer::TextBuffer;
 use crate::{CloseWindow, QuitApp, theme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,16 +38,16 @@ pub struct LearnApp {
     user: Option<User>,
     known_usernames: Vec<String>,
     is_register_mode: bool,
-    auth_username: String,
-    auth_password: String,
+    auth_username: TextBuffer,
+    auth_password: TextBuffer,
 
     // Navigation & form state
     route: Route,
     active_field: ActiveField,
-    new_topic_title: String,
+    new_topic_title: TextBuffer,
     new_topic_level: SkillLevel,
-    gemini_key_input: String,
-    openai_key_input: String,
+    gemini_key_input: TextBuffer,
+    openai_key_input: TextBuffer,
 
     // Domain state
     runners: Vec<DetectedRunner>,
@@ -61,7 +62,7 @@ pub struct LearnApp {
     prefetching: bool,
     prefetch_topic_id: Option<String>,
     buffered_ready: usize,
-    clarify_input: String,
+    clarify_input: TextBuffer,
     clarify_busy: bool,
     clarify_replies: Vec<ClarifyingReply>,
     error_banner: Option<String>,
@@ -89,14 +90,14 @@ impl LearnApp {
             user: None,
             known_usernames,
             is_register_mode,
-            auth_username: String::new(),
-            auth_password: String::new(),
+            auth_username: TextBuffer::new(),
+            auth_password: TextBuffer::new(),
             route: Route::Dashboard,
             active_field: ActiveField::AuthUsername,
-            new_topic_title: String::new(),
+            new_topic_title: TextBuffer::new(),
             new_topic_level: SkillLevel::Beginner,
-            gemini_key_input: String::new(),
-            openai_key_input: String::new(),
+            gemini_key_input: TextBuffer::new(),
+            openai_key_input: TextBuffer::new(),
             runners,
             topics: Vec::new(),
             active_topic_id: None,
@@ -107,7 +108,7 @@ impl LearnApp {
             prefetching: false,
             prefetch_topic_id: None,
             buffered_ready: 0,
-            clarify_input: String::new(),
+            clarify_input: TextBuffer::new(),
             clarify_busy: false,
             clarify_replies: Vec::new(),
             error_banner: None,
@@ -122,15 +123,17 @@ impl LearnApp {
         self.info_banner = None;
 
         let res = if self.is_register_mode {
-            self.service.register(&self.auth_username, &self.auth_password)
+            self.service
+                .register(self.auth_username.as_str(), self.auth_password.as_str())
         } else {
-            self.service.login(&self.auth_username, &self.auth_password)
+            self.service
+                .login(self.auth_username.as_str(), self.auth_password.as_str())
         };
 
         match res {
             Ok(user) => {
-                self.gemini_key_input = user.gemini_api_key.clone();
-                self.openai_key_input = user.openai_api_key.clone();
+                self.gemini_key_input.set_text(user.gemini_api_key.clone());
+                self.openai_key_input.set_text(user.openai_api_key.clone());
                 self.runners = self.service.detect_runners(Some(&user));
                 self.topics = self.service.list_topics(&user.id).unwrap_or_default();
                 self.known_usernames = self.service.list_usernames().unwrap_or_default();
@@ -203,7 +206,7 @@ impl LearnApp {
 
     fn create_topic(&mut self, cx: &mut Context<Self>) {
         let Some(user) = self.user.clone() else { return };
-        let title = self.new_topic_title.trim().to_string();
+        let title = self.new_topic_title.as_str().trim().to_string();
         if title.is_empty() {
             self.error_banner = Some("Enter a topic you want to learn first.".into());
             cx.notify();
@@ -377,7 +380,7 @@ impl LearnApp {
         let Some(user) = self.user.clone() else { return };
         let Some(topic_id) = self.active_topic_id.clone() else { return };
         let Some(question) = self.current_question.clone() else { return };
-        let prompt_text = self.clarify_input.trim().to_string();
+        let prompt_text = self.clarify_input.as_str().trim().to_string();
         if prompt_text.is_empty() || self.clarify_busy {
             return;
         }
@@ -545,8 +548,8 @@ impl LearnApp {
         match self.service.update_runner(
             &user.id,
             kind,
-            Some(&self.gemini_key_input),
-            Some(&self.openai_key_input),
+            Some(self.gemini_key_input.as_str()),
+            Some(self.openai_key_input.as_str()),
         ) {
             Ok(updated) => {
                 self.runners = self.service.detect_runners(Some(&updated));
@@ -570,8 +573,8 @@ impl LearnApp {
         match self.service.update_runner(
             &user.id,
             user.runner,
-            Some(&self.gemini_key_input),
-            Some(&self.openai_key_input),
+            Some(self.gemini_key_input.as_str()),
+            Some(self.openai_key_input.as_str()),
         ) {
             Ok(updated) => {
                 self.runners = self.service.detect_runners(Some(&updated));
@@ -594,8 +597,12 @@ impl LearnApp {
 
     // ---------- Keyboard Input Handling ----------
 
-    fn active_field_mut(&mut self) -> Option<&mut String> {
-        match self.active_field {
+    fn active_field_mut(&mut self) -> Option<&mut TextBuffer> {
+        self.field_buffer_mut(self.active_field)
+    }
+
+    fn field_buffer_mut(&mut self, field: ActiveField) -> Option<&mut TextBuffer> {
+        match field {
             ActiveField::None => None,
             ActiveField::AuthUsername => Some(&mut self.auth_username),
             ActiveField::AuthPassword => Some(&mut self.auth_password),
@@ -606,28 +613,166 @@ impl LearnApp {
         }
     }
 
+    fn is_active_field_masked(&self) -> bool {
+        matches!(
+            self.active_field,
+            ActiveField::AuthPassword | ActiveField::GeminiKey | ActiveField::OpenaiKey
+        )
+    }
+
     fn handle_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
-        let cmd_or_ctrl = ks.modifiers.platform || ks.modifiers.control;
+        let cmd = ks.modifiers.platform;
+        let ctrl = ks.modifiers.control;
+        let alt = ks.modifiers.alt;
+        let shift = ks.modifiers.shift;
+        let cmd_or_ctrl = cmd || ctrl;
 
         if cmd_or_ctrl && ks.key.eq_ignore_ascii_case("q") {
             cx.quit();
             return;
         }
-        if cmd_or_ctrl && ks.key.eq_ignore_ascii_case("w") {
+        if cmd && ks.key.eq_ignore_ascii_case("w") {
             window.remove_window();
             return;
         }
 
-        if cmd_or_ctrl && ks.key.eq_ignore_ascii_case("v") {
-            if let Some(clip) = cx.read_from_clipboard().and_then(|c| c.text()) {
-                let clean = clip.replace(['\r', '\n'], " ");
+        // Standard text-field shortcuts when an input is focused
+        if self.active_field != ActiveField::None {
+            if cmd_or_ctrl && ks.key.eq_ignore_ascii_case("a") {
                 if let Some(buf) = self.active_field_mut() {
-                    buf.push_str(&clean);
+                    buf.select_all();
                     cx.notify();
                 }
+                return;
             }
-            return;
+
+            if cmd_or_ctrl && ks.key.eq_ignore_ascii_case("c") {
+                if !self.is_active_field_masked() {
+                    if let Some(buf) = self.active_field_mut() {
+                        if buf.has_selection() {
+                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                buf.selected_text().to_string(),
+                            ));
+                        }
+                    }
+                }
+                return;
+            }
+
+            if cmd_or_ctrl && ks.key.eq_ignore_ascii_case("x") {
+                let masked = self.is_active_field_masked();
+                if let Some(buf) = self.active_field_mut() {
+                    if buf.has_selection() {
+                        if !masked {
+                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                buf.selected_text().to_string(),
+                            ));
+                        }
+                        buf.delete_selection();
+                        cx.notify();
+                    }
+                }
+                return;
+            }
+
+            if cmd_or_ctrl && ks.key.eq_ignore_ascii_case("v") {
+                if let Some(clip) = cx.read_from_clipboard().and_then(|c| c.text()) {
+                    let clean = clip.replace(['\r', '\n'], " ");
+                    if let Some(buf) = self.active_field_mut() {
+                        buf.insert_str(&clean);
+                        cx.notify();
+                    }
+                }
+                return;
+            }
+
+            // Ctrl+U / Ctrl+W / Ctrl+K unix/macOS line & word deletion shortcuts
+            if ctrl && !cmd && ks.key.eq_ignore_ascii_case("w") {
+                if let Some(buf) = self.active_field_mut() {
+                    buf.delete_word_backward();
+                    cx.notify();
+                }
+                return;
+            }
+            if ctrl && !cmd && ks.key.eq_ignore_ascii_case("u") {
+                if let Some(buf) = self.active_field_mut() {
+                    buf.delete_to_start();
+                    cx.notify();
+                }
+                return;
+            }
+            if ctrl && !cmd && ks.key.eq_ignore_ascii_case("k") {
+                if let Some(buf) = self.active_field_mut() {
+                    buf.delete_to_end();
+                    cx.notify();
+                }
+                return;
+            }
+
+            match ks.key.as_str() {
+                "backspace" => {
+                    if let Some(buf) = self.active_field_mut() {
+                        if cmd {
+                            buf.delete_to_start();
+                        } else if alt || ctrl {
+                            buf.delete_word_backward();
+                        } else {
+                            buf.backspace();
+                        }
+                        cx.notify();
+                    }
+                    return;
+                }
+                "delete" => {
+                    if let Some(buf) = self.active_field_mut() {
+                        buf.delete_forward();
+                        cx.notify();
+                    }
+                    return;
+                }
+                "left" => {
+                    if let Some(buf) = self.active_field_mut() {
+                        if cmd {
+                            buf.move_to_start(shift);
+                        } else if alt {
+                            buf.move_word_left(shift);
+                        } else {
+                            buf.move_left(shift);
+                        }
+                        cx.notify();
+                    }
+                    return;
+                }
+                "right" => {
+                    if let Some(buf) = self.active_field_mut() {
+                        if cmd {
+                            buf.move_to_end(shift);
+                        } else if alt {
+                            buf.move_word_right(shift);
+                        } else {
+                            buf.move_right(shift);
+                        }
+                        cx.notify();
+                    }
+                    return;
+                }
+                "home" => {
+                    if let Some(buf) = self.active_field_mut() {
+                        buf.move_to_start(shift);
+                        cx.notify();
+                    }
+                    return;
+                }
+                "end" => {
+                    if let Some(buf) = self.active_field_mut() {
+                        buf.move_to_end(shift);
+                        cx.notify();
+                    }
+                    return;
+                }
+                _ => {}
+            }
         }
 
         if self.user.is_some() && self.route == Route::Quiz && self.active_field == ActiveField::None {
@@ -662,6 +807,9 @@ impl LearnApp {
                 ActiveField::AuthUsername => ActiveField::AuthPassword,
                 _ => ActiveField::AuthUsername,
             };
+            if let Some(buf) = self.active_field_mut() {
+                buf.select_all();
+            }
             cx.notify();
             return;
         }
@@ -677,31 +825,23 @@ impl LearnApp {
             return;
         }
 
-        if ks.key == "backspace" {
-            if let Some(buf) = self.active_field_mut() {
-                buf.pop();
-                cx.notify();
-            }
-            return;
-        }
-
         if ks.key == "escape" {
             self.active_field = ActiveField::None;
             cx.notify();
             return;
         }
 
-        if !cmd_or_ctrl && !ks.modifiers.alt {
+        if !cmd_or_ctrl && !alt {
             if let Some(ch) = &ks.key_char {
                 if !ch.is_empty() && !ch.chars().all(|c| c.is_control()) {
                     if let Some(buf) = self.active_field_mut() {
-                        buf.push_str(ch);
+                        buf.insert_str(ch);
                         cx.notify();
                     }
                 }
             } else if ks.key == "space" {
                 if let Some(buf) = self.active_field_mut() {
-                    buf.push(' ');
+                    buf.insert_str(" ");
                     cx.notify();
                 }
             }
@@ -714,21 +854,71 @@ impl LearnApp {
         &self,
         id: &'static str,
         label: &str,
-        value: &str,
+        buffer: &TextBuffer,
         placeholder: &str,
         masked: bool,
         field: ActiveField,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let focused = self.active_field == field;
-        let display_text = if value.is_empty() {
-            placeholder.to_string()
-        } else if masked {
-            "•".repeat(value.chars().count())
+        let is_empty = buffer.is_empty();
+        let (before, selected, after) = buffer.display_parts(masked);
+        let has_sel = !selected.is_empty();
+
+        let text_content: AnyElement = if is_empty {
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .text_color(theme::text_muted())
+                .child(if focused {
+                    format!("| {placeholder}")
+                } else {
+                    placeholder.to_string()
+                })
+                .into_any_element()
+        } else if focused {
+            let mut row = div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .text_sm()
+                .text_color(theme::text_primary());
+
+            if !before.is_empty() {
+                row = row.child(before);
+            }
+            if has_sel {
+                row = row.child(
+                    div()
+                        .rounded_xs()
+                        .bg(theme::accent())
+                        .text_color(theme::pure_white())
+                        .child(selected),
+                );
+            } else {
+                row = row.child(
+                    div()
+                        .text_color(theme::accent_text())
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .child("|"),
+                );
+            }
+            if !after.is_empty() {
+                row = row.child(after);
+            }
+            row.into_any_element()
         } else {
-            value.to_string()
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .text_color(theme::text_primary())
+                .child(format!("{before}{selected}{after}"))
+                .into_any_element()
         };
-        let is_placeholder = value.is_empty();
 
         div()
             .flex()
@@ -753,6 +943,8 @@ impl LearnApp {
                     .py_2()
                     .flex()
                     .items_center()
+                    .justify_between()
+                    .gap_2()
                     .overflow_hidden()
                     .rounded_md()
                     .bg(theme::bg_input())
@@ -763,31 +955,45 @@ impl LearnApp {
                         theme::border_subtle()
                     })
                     .cursor_text()
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        let was_focused = this.active_field == field;
                         this.active_field = field;
                         window.focus(&this.focus_handle);
+                        if let Some(buf) = this.field_buffer_mut(field) {
+                            if event.click_count() >= 2 {
+                                buf.select_all();
+                            } else if !was_focused {
+                                buf.collapse_to_end();
+                            } else if buf.has_selection() {
+                                buf.collapse_to_end();
+                            }
+                        }
                         cx.notify();
                     }))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .text_sm()
-                            .text_color(if is_placeholder {
-                                theme::text_muted()
-                            } else {
-                                theme::text_primary()
-                            })
-                            .child(if focused {
-                                if is_placeholder {
-                                    format!("| {display_text}")
-                                } else {
-                                    format!("{display_text}|")
-                                }
-                            } else {
-                                display_text
-                            }),
-                    ),
+                    .child(text_content)
+                    .when(!is_empty, |el| {
+                        el.child(
+                            div()
+                                .id((id, 999usize))
+                                .flex_shrink_0()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_sm()
+                                .hover(|s| s.bg(theme::bg_card_hover()))
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(theme::text_muted())
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.active_field = field;
+                                    window.focus(&this.focus_handle);
+                                    if let Some(buf) = this.field_buffer_mut(field) {
+                                        buf.clear();
+                                    }
+                                    cx.notify();
+                                }))
+                                .child("×"),
+                        )
+                    }),
             )
     }
 
@@ -976,7 +1182,7 @@ impl LearnApp {
                         .text_xs()
                         .text_color(theme::text_primary())
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.auth_username = u_clone.clone();
+                            this.auth_username.set_text(u_clone.clone());
                             this.active_field = ActiveField::AuthPassword;
                             cx.notify();
                         }))
