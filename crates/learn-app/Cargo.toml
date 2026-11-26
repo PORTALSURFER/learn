@@ -1,0 +1,14 @@
+[package]
+name = "learn-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "learn"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+learn-core = { path = "../learn-core" }
+serde_json.workspace = true
