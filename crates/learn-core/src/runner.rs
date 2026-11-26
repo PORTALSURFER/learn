@@ -121,8 +121,8 @@ pub fn media_object_schema() -> Value {
             "kind", "reveal", "title", "caption",
             "values", "labels", "flowSteps",
             "leftTitle", "leftPoints", "rightTitle", "rightPoints",
-            "bpm", "baseHz", "cutoffStartHz", "cutoffEndHz",
-            "accentStep", "nudgeMs", "includeDrums",
+            "voice", "bpm", "baseHz", "cutoffStartHz", "cutoffEndHz",
+            "afterValues", "accentStep", "nudgeMs", "includeDrums",
             "beforeLabel", "afterLabel", "html"
         ],
         "properties": {
@@ -137,6 +137,7 @@ pub fn media_object_schema() -> Value {
             "title": { "type": "string" },
             "caption": { "type": "string" },
             "values": { "type": "array", "items": { "type": "number" } },
+            "afterValues": { "type": "array", "items": { "type": "number" } },
             "labels": { "type": "array", "items": { "type": "string" } },
             "flowSteps": {
                 "type": "array",
@@ -154,6 +155,7 @@ pub fn media_object_schema() -> Value {
             "leftPoints": { "type": "array", "items": { "type": "string" } },
             "rightTitle": { "type": "string" },
             "rightPoints": { "type": "array", "items": { "type": "string" } },
+            "voice": { "type": "string", "enum": ["synth", "rim_click", "kick_bass", "delay"] },
             "bpm": { "type": "number" },
             "baseHz": { "type": "number" },
             "cutoffStartHz": { "type": "number" },
@@ -306,6 +308,8 @@ struct RawMedia {
     #[serde(default)]
     values: Vec<f32>,
     #[serde(default)]
+    after_values: Vec<f32>,
+    #[serde(default)]
     labels: Vec<String>,
     #[serde(default)]
     flow_steps: Vec<FlowStep>,
@@ -317,6 +321,8 @@ struct RawMedia {
     right_title: String,
     #[serde(default)]
     right_points: Vec<String>,
+    #[serde(default)]
+    voice: String,
     #[serde(default)]
     bpm: f32,
     #[serde(default)]
@@ -541,10 +547,17 @@ fn convert_raw_media(m: RawMedia) -> Option<ExampleMedia> {
             caption,
             reveal,
             spec: AudioDemoSpec {
+                voice: match m.voice.trim().to_lowercase().as_str() {
+                    "rim_click" | "kick_bass" | "delay" | "synth" => m.voice.trim().to_lowercase(),
+                    _ => "synth".into(),
+                },
                 bpm: if m.bpm > 40.0 { m.bpm } else { 128.0 },
                 base_hz: if m.base_hz > 30.0 { m.base_hz } else { 110.0 },
                 cutoff_start_hz: if m.cutoff_start_hz > 60.0 { m.cutoff_start_hz } else { 350.0 },
                 cutoff_end_hz: if m.cutoff_end_hz > 60.0 { m.cutoff_end_hz } else { 3200.0 },
+                step_levels: m.values.into_iter().take(16).map(|v| v.clamp(0.0, 1.0)).collect(),
+                after_step_levels: m.after_values.into_iter().take(16).map(|v| v.clamp(0.0, 1.0)).collect(),
+                step_labels: m.labels.into_iter().take(16).collect(),
                 accent_step: if (1..=16).contains(&m.accent_step) { Some(m.accent_step as u8) } else { None },
                 nudge_ms: m.nudge_ms,
                 include_drums: m.include_drums,
@@ -700,7 +713,7 @@ pub fn build_question_prompt(directive: &SchedulerDirective) -> String {
     lines.push("- `goal`: 1-2 plain-English sentences explaining the HUMAN, EMOTIONAL, PERCEPTUAL, or PRACTICAL WHY first—why a real practitioner would want this effect or outcome in the first place (e.g., what feeling, tension, groove, or real-world problem it solves), not just dry mechanics.".into());
     lines.push("- `hint`: 1 crisp sentence nudging the learner toward the mental model WITHOUT revealing or naming the correct choice.".into());
     lines.push("- `media`: ACTIVELY include a concrete supporting example on almost every question (`reveal: \"before_answer\"` by default!) so the learner can SEE, HEAR, or FEEL the goal and setup before answering—without spoiling which option A-D is correct. Pick the SINGLE best modality for this specific topic & question (unused fields = empty string/array/0):".into());
-    lines.push("  * `audio`: STRONGLY PREFERRED for music, sound design, rhythm, groove, or acoustics questions! Set `bpm`, `baseHz`, `cutoffStartHz`, `cutoffEndHz`, `accentStep` (1..16 or 0), `nudgeMs`, `includeDrums`, `beforeLabel`, `afterLabel` so our built-in Rust synth lets the learner HEAR the sound/groove live right inside the question! Use `reveal: \"before_answer\"` to let them hear the starting loop or compare the sonic feel directly.".into());
+    lines.push("  * `audio`: STRONGLY PREFERRED for music, sound design, rhythm, groove, or acoustics! Choose `voice` ('rim_click' for beat/accent clicks, 'kick_bass' for low-end pocket/envelopes, 'delay' for rhythmic echo, or 'synth' for filter/timbre sweeps) + populate `values` (4-16 step intensities 0.0..1.0) and `labels` (e.g. ['1','2','3','4']) so our UI renders a synced VISUAL STEP GRID right above the Play buttons! Set `afterValues` for the after/target pattern when comparing, and set `reveal: \"before_answer\"` so the learner can immediately SEE & HEAR the setup before choosing.".into());
     lines.push("  * `curve`: 4-16 normalized values (0.0..1.0) + concise labels — ideal for filter/energy curves, 16-step velocity/accent grids, math functions, growth curves, or envelopes.".into());
     lines.push("  * `flow`: 2-5 connected `flowSteps` (`label`, `note`) — ideal for signal chains, protocols, lifecycles, causal steps, or pipelines.".into());
     lines.push("  * `contrast`: side-by-side comparison (`leftTitle`/`leftPoints` vs `rightTitle`/`rightPoints`) — ideal for clarifying two competing forces or setups in the question.".into());
@@ -1247,6 +1260,7 @@ fn demo_question(directive: &SchedulerDirective) -> Value {
             "title": format!("{} Flow", directive.concept.title),
             "caption": "How the core mental model connects input, mechanism, and outcome.",
             "values": [],
+            "afterValues": [],
             "labels": [],
             "flowSteps": [
                 { "label": "Context", "note": directive.compressed_context.topic_title },
@@ -1257,6 +1271,7 @@ fn demo_question(directive: &SchedulerDirective) -> Value {
             "leftPoints": [],
             "rightTitle": "",
             "rightPoints": [],
+            "voice": "synth",
             "bpm": 0,
             "baseHz": 0,
             "cutoffStartHz": 0,

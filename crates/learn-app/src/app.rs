@@ -2545,19 +2545,24 @@ impl LearnApp {
                 let before_lbl = spec
                     .before_label
                     .clone()
-                    .unwrap_or_else(|| "Before (Flat / Dry)".into());
+                    .unwrap_or_else(|| "Hear Starting Pattern".into());
                 let after_lbl = spec
                     .after_label
                     .clone()
-                    .unwrap_or_else(|| "After (Target Effect)".into());
+                    .unwrap_or_else(|| "Hear Target Effect".into());
                 let b_status = before_lbl.clone();
                 let a_status = after_lbl.clone();
+                let show_after_btn = self.last_answer.is_some()
+                    || !spec.after_step_levels.is_empty()
+                    || (spec.cutoff_end_hz - spec.cutoff_start_hz).abs() > 200.0
+                    || spec.nudge_ms.abs() > 1.0
+                    || spec.voice != "rim_click";
 
-                div()
+                let mut card = div()
                     .w_full()
                     .min_w_0()
                     .p_4()
-                    .rounded_lg()
+                    .rounded_md()
                     .bg(theme::bg_input())
                     .border_1()
                     .border_color(theme::accent())
@@ -2576,7 +2581,10 @@ impl LearnApp {
                                     .text_xs()
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(theme::accent_text())
-                                    .child(format!("Audio Example · {title}")),
+                                    .child(format!(
+                                        "AUDIO + VISUAL // {} ({:.0} BPM)",
+                                        title, spec.bpm
+                                    )),
                             )
                             .when_some(self.audio_status.clone(), |el, st| {
                                 el.child(
@@ -2586,52 +2594,102 @@ impl LearnApp {
                                         .child(st),
                                 )
                             }),
-                    )
-                    .when(!caption.is_empty(), |el| {
-                        el.child(
+                    );
+
+                // Synced visual step bar grid inside the audio card so the learner SEES & HEARS it!
+                if !spec.step_levels.is_empty() {
+                    let mut bars = div()
+                        .w_full()
+                        .h(px(68.0))
+                        .flex()
+                        .items_end()
+                        .gap_1p5()
+                        .pt_1();
+                    for (i, val) in spec.step_levels.iter().enumerate() {
+                        let v = val.clamp(0.08, 1.0);
+                        let lbl = spec
+                            .step_labels
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| format!("{}", i + 1));
+                        bars = bars.child(
                             div()
-                                .w_full()
-                                .min_w_0()
-                                .text_xs()
-                                .text_color(theme::text_secondary())
-                                .child(caption.clone()),
-                        )
-                    })
-                    .child(
+                                .flex_1()
+                                .min_w(px(12.0))
+                                .h_full()
+                                .flex()
+                                .flex_col()
+                                .justify_end()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .h(px(46.0 * v))
+                                        .rounded_t_xs()
+                                        .bg(if v >= 0.78 {
+                                            theme::accent()
+                                        } else {
+                                            theme::emerald()
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::text_muted())
+                                        .child(lbl),
+                                ),
+                        );
+                    }
+                    card = card.child(bars);
+                }
+
+                card.when(!caption.is_empty(), |el| {
+                    el.child(
                         div()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("btn-audio-before")
-                                    .px_3()
-                                    .py_1p5()
-                                    .rounded_md()
-                                    .bg(theme::bg_card())
-                                    .border_1()
-                                    .border_color(theme::border_subtle())
-                                    .hover(|s| s.border_color(theme::accent()))
-                                    .cursor_pointer()
-                                    .text_xs()
-                                    .text_color(theme::text_primary())
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        this.play_audio_demo(
-                                            spec_before.clone(),
-                                            true,
-                                            b_status.clone(),
-                                            cx,
-                                        );
-                                    }))
-                                    .child(format!("▶ {before_lbl}")),
-                            )
-                            .child(
+                            .w_full()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(theme::text_secondary())
+                            .child(caption.clone()),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("btn-audio-before")
+                                .px_3()
+                                .py_1p5()
+                                .rounded_sm()
+                                .bg(theme::bg_card())
+                                .border_1()
+                                .border_color(theme::border_subtle())
+                                .hover(|s| s.border_color(theme::accent()))
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(theme::text_primary())
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.play_audio_demo(
+                                        spec_before.clone(),
+                                        true,
+                                        b_status.clone(),
+                                        cx,
+                                    );
+                                }))
+                                .child(format!("▶ {before_lbl}")),
+                        )
+                        .when(show_after_btn, |el| {
+                            el.child(
                                 div()
                                     .id("btn-audio-after")
                                     .px_3()
                                     .py_1p5()
-                                    .rounded_md()
+                                    .rounded_sm()
                                     .bg(theme::accent())
                                     .hover(|s| s.bg(theme::accent_hover()))
                                     .cursor_pointer()
@@ -2648,28 +2706,29 @@ impl LearnApp {
                                     }))
                                     .child(format!("▶ {after_lbl}")),
                             )
-                            .when(self.audio_child.is_some(), |el| {
-                                el.child(
-                                    div()
-                                        .id("btn-audio-stop")
-                                        .px_3()
-                                        .py_1p5()
-                                        .rounded_md()
-                                        .bg(theme::rose_soft())
-                                        .border_1()
-                                        .border_color(theme::rose())
-                                        .cursor_pointer()
-                                        .text_xs()
-                                        .text_color(theme::rose_text())
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            this.stop_audio_quiet();
-                                            cx.notify();
-                                        }))
-                                        .child("■ Stop"),
-                                )
-                            }),
-                    )
-                    .into_any_element()
+                        })
+                        .when(self.audio_child.is_some(), |el| {
+                            el.child(
+                                div()
+                                    .id("btn-audio-stop")
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_sm()
+                                    .bg(theme::rose_soft())
+                                    .border_1()
+                                    .border_color(theme::rose())
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(theme::rose_text())
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.stop_audio_quiet();
+                                        cx.notify();
+                                    }))
+                                    .child("■ Stop"),
+                            )
+                        }),
+                )
+                .into_any_element()
             }
             ExampleMedia::InteractiveHtml {
                 title,

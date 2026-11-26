@@ -350,10 +350,14 @@ pub struct FlowStep {
     pub note: String,
 }
 
-/// Declarative audio demo parameters synthesized in pure Rust to a temporary WAV file.
-/// Supports melodic/synth motifs, low-pass filter sweeps, kick/hat groove, accent, and microtiming.
+/// Declarative audio+visual demo parameters synthesized in pure Rust to a temporary WAV file.
+/// Supports melodic/synth motifs, rim-click accent patterns, kick/bass envelopes, rhythmic delay,
+/// low-pass filter sweeps, and microtiming nudges—plus synced visual step bars in the UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioDemoSpec {
+    /// Sound engine voice: "synth" | "rim_click" | "kick_bass" | "delay"
+    #[serde(default = "default_voice")]
+    pub voice: String,
     #[serde(default = "default_bpm")]
     pub bpm: f32,
     #[serde(default = "default_base_hz")]
@@ -363,6 +367,15 @@ pub struct AudioDemoSpec {
     pub cutoff_start_hz: f32,
     #[serde(default = "default_cutoff_end")]
     pub cutoff_end_hz: f32,
+    /// Optional 4..16 normalized step intensities (0.0..1.0) shown visually AND played in "Before".
+    #[serde(default)]
+    pub step_levels: Vec<f32>,
+    /// Optional 4..16 normalized step intensities for "After" comparison (defaults to `step_levels`).
+    #[serde(default)]
+    pub after_step_levels: Vec<f32>,
+    /// Short labels for each step bar (e.g. ["1","2","3","4"]).
+    #[serde(default)]
+    pub step_labels: Vec<String>,
     /// Optional 1-based step (1..=16) to accent/nudge in rhythmic examples.
     #[serde(default)]
     pub accent_step: Option<u8>,
@@ -377,6 +390,10 @@ pub struct AudioDemoSpec {
     pub before_label: Option<String>,
     #[serde(default)]
     pub after_label: Option<String>,
+}
+
+fn default_voice() -> String {
+    "synth".into()
 }
 
 fn default_bpm() -> f32 {
