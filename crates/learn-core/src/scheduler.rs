@@ -9,37 +9,85 @@ use crate::models::{
     TopicSummary,
 };
 
-fn subtopic_diversity_adjustment(subtopic: &str, recent_trail: &[(String, String)]) -> f64 {
+fn subtopic_diversity_adjustment(
+    subtopic: &str,
+    subtopic_attempts: &HashMap<String, u32>,
+    total_attempts: u32,
+    recent_trail: &[(String, String, QuestionIntent)],
+) -> f64 {
     let target = subtopic.trim().to_lowercase();
-    for (idx, (_, recent_sub)) in recent_trail.iter().take(4).enumerate() {
-        if recent_sub.trim().to_lowercase() == target {
-            return match idx {
-                0 => -1.10, // Immediately previous question's subtopic
-                1 => -0.55, // 2 turns ago
-                2 => -0.25, // 3 turns ago
-                _ => -0.10,
-            };
-        }
-    }
-    // Untouched in the recent trail -> strong variety boost!
-    0.70
+
+    // 1. Recency penalty across the last 6 turns so we continually jump across pillars.
+    let recency = recent_trail
+        .iter()
+        .take(6)
+        .enumerate()
+        .find(|(_, (_, recent_sub, _))| recent_sub.trim().to_lowercase() == target)
+        .map(|(idx, _)| match idx {
+            0 => -1.25, // Immediately previous question's pillar
+            1 => -0.70, // 2 turns ago
+            2 => -0.40, // 3 turns ago
+            3 => -0.22, // 4 turns ago
+            4 => -0.12, // 5 turns ago
+            _ => -0.06,
+        })
+        .unwrap_or(0.75);
+
+    // 2. Exploration vs saturation balance across pillars:
+    // Untouched pillars (0 attempts) get a strong boost; heavily drilled pillars cool down.
+    let attempts_here = subtopic_attempts.get(&target).copied().unwrap_or(0);
+    let balance = if attempts_here == 0 {
+        0.85
+    } else if total_attempts >= 4 {
+        let share = (attempts_here as f64) / (total_attempts as f64);
+        // Penalize pillars that already hold >30% of all attempts
+        -((share - 0.25).max(0.0) * 1.10).min(0.55)
+    } else {
+        0.0
+    };
+
+    recency + balance
 }
 
-fn is_recently_asked_concept(concept_id: &str, recent_trail: &[(String, String)], window: usize) -> bool {
+fn is_recently_asked_concept(
+    concept_id: &str,
+    recent_trail: &[(String, String, QuestionIntent)],
+    window: usize,
+) -> bool {
     recent_trail
         .iter()
         .take(window)
-        .any(|(cid, _)| cid == concept_id)
+        .any(|(cid, _, _)| cid == concept_id)
+}
+
+/// Detects when a topic's knowledge map is too narrow (few concepts / missing major pillars /
+/// running low on unseen material) so `LearnService` can automatically broaden it without
+/// forcing the learner to master 100% of one narrow subtopic first.
+pub fn should_broaden_map(concepts: &[ConceptNode], total_attempts: u32) -> bool {
+    if concepts.len() >= 14 {
+        return false;
+    }
+    let distinct_subtopics: HashSet<String> = concepts
+        .iter()
+        .map(|c| c.subtopic.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let unseen_count = concepts
+        .iter()
+        .filter(|c| c.status == ConceptStatus::Unseen)
+        .count();
+
+    total_attempts >= 3 && (distinct_subtopics.len() < 5 || unseen_count <= 2)
 }
 
 /// Cognitive-Mesh-aware Interleaved Learning Scheduler:
-/// Actively rotates across subtopics so the learner never gets tunnel vision,
-/// spacing mistake retries ~2 turns apart while balancing:
-/// 1. High-probability active shadow misconception / inhibitory `Confuses` pair / due `NeedsReview` (spaced away from last 2 turns)
+/// Actively rotates across all major pillars/subtopics of a subject so the learner never gets
+/// tunnel vision, throttling mistake reviews when unexplored pillars exist while balancing:
+/// 1. High-probability active shadow misconception / inhibitory `Confuses` pair / due `NeedsReview` (throttled when fresh unseen pillars exist)
 /// 2. High-tension predictive-coding seam (`tension >= 0.45`)
 /// 3. Due spaced-repetition reinforcement
-/// 4. Highest information-gain + freshest-subtopic frontier concept (unseen & active learning)
-/// 5. Deepening (`dig_deeper`) & Knowledge Map expansion once current nodes are mastered
+/// 4. Highest information-gain + freshest/unexplored-pillar frontier concept
+/// 5. Automatic breadth broadening (narrow maps) & deepening (`dig_deeper`) once mastered
 pub fn select_next_directive(
     topic: &TopicSummary,
     concepts: &[ConceptNode],
@@ -48,11 +96,22 @@ pub fn select_next_directive(
     cross_topic_anchors: &[CrossTopicAnchor],
     now_ms: i64,
     exclude_ids: &HashSet<String>,
-    recent_trail: &[(String, String)],
+    recent_trail: &[(String, String, QuestionIntent)],
 ) -> Result<SchedulerDirective> {
     if concepts.is_empty() {
         return Err(anyhow!("Cannot schedule a question without concepts in the knowledge map."));
     }
+
+    let mut subtopic_attempts: HashMap<String, u32> = HashMap::new();
+    let mut total_concept_attempts: u32 = 0;
+    for c in concepts {
+        *subtopic_attempts
+            .entry(c.subtopic.trim().to_lowercase())
+            .or_insert(0) += c.attempts;
+        total_concept_attempts += c.attempts;
+    }
+    let effective_attempts = topic.total_attempts.max(total_concept_attempts);
+    let broaden_map = should_broaden_map(concepts, effective_attempts);
 
     // Prefer concepts not already sitting in the open queue AND not asked in the last 2 turns.
     let mut non_excluded: Vec<&ConceptNode> = concepts
@@ -119,7 +178,7 @@ pub fn select_next_directive(
         concept: pick.clone(),
         target_depth,
         reason,
-        requires_new_concepts,
+        requires_new_concepts: requires_new_concepts || broaden_map,
         compressed_context: CompressedContext {
             topic_title: topic.title.clone(),
             level: topic.level,
@@ -132,109 +191,157 @@ pub fn select_next_directive(
         },
     };
 
-    // Check if there are completely untouched subtopics we haven't even explored yet;
-    // when the previous question was in a different subtopic and we've already done 2+ reviews in a row,
-    // we still let diversity guide review selection below.
     let subtopic_is_just_asked = |sub: &str| {
         recent_trail
             .first()
-            .map(|(_, s)| s.eq_ignore_ascii_case(sub))
+            .map(|(_, s, _)| s.eq_ignore_ascii_case(sub))
             .unwrap_or(false)
     };
 
-    // 1A. Diagnostic probe for a high-probability active Misconception Shadow Node (prefer fresh subtopic)
-    let mut eligible_hyps: Vec<(&MisconceptionNode, &ConceptNode, f64)> = Vec::new();
-    for hyp in misconceptions.iter().filter(|m| m.probability >= 0.55) {
-        for slug in &hyp.linked_concepts {
-            if let Some(pick) = by_slug.get(slug.as_str()).copied() {
-                if candidate_ids.contains(pick.id.as_str())
-                    && pick.next_review_at.map_or(true, |ts| ts <= now_ms)
-                {
-                    let score = hyp.probability + subtopic_diversity_adjustment(&pick.subtopic, recent_trail) * 0.5;
-                    eligible_hyps.push((hyp, pick, score));
+    // Throttle mistake-review spam when unexplored concepts exist in other subtopics:
+    // never run two ReviewMistake turns back-to-back or >1 in the last 2 turns when fresh pillars await!
+    let has_fresh_unseen_elsewhere = candidates
+        .iter()
+        .any(|c| c.status == ConceptStatus::Unseen && !subtopic_is_just_asked(&c.subtopic));
+    let last_was_review = recent_trail
+        .first()
+        .map(|(_, _, intent)| *intent == QuestionIntent::ReviewMistake)
+        .unwrap_or(false);
+    let reviews_in_last_3 = recent_trail
+        .iter()
+        .take(3)
+        .filter(|(_, _, intent)| *intent == QuestionIntent::ReviewMistake)
+        .count();
+    let allow_review_priority =
+        !has_fresh_unseen_elsewhere || (!last_was_review && reviews_in_last_3 < 2);
+
+    if allow_review_priority {
+        // 1A. Diagnostic probe for a high-probability active Misconception Shadow Node (prefer fresh subtopic)
+        let mut eligible_hyps: Vec<(&MisconceptionNode, &ConceptNode, f64)> = Vec::new();
+        for hyp in misconceptions.iter().filter(|m| m.probability >= 0.55) {
+            for slug in &hyp.linked_concepts {
+                if let Some(pick) = by_slug.get(slug.as_str()).copied() {
+                    if candidate_ids.contains(pick.id.as_str())
+                        && (!has_fresh_unseen_elsewhere || !is_recently_asked_concept(&pick.id, recent_trail, 3))
+                        && pick.next_review_at.map_or(true, |ts| ts <= now_ms)
+                    {
+                        let score = hyp.probability
+                            + subtopic_diversity_adjustment(
+                                &pick.subtopic,
+                                &subtopic_attempts,
+                                effective_attempts,
+                                recent_trail,
+                            ) * 0.5;
+                        eligible_hyps.push((hyp, pick, score));
+                    }
                 }
             }
         }
-    }
-    eligible_hyps.sort_by(|a, b| b.2.total_cmp(&a.2));
-    if let Some((top_hyp, pick, _)) = eligible_hyps.first() {
-        if !subtopic_is_just_asked(&pick.subtopic) || candidates.iter().all(|c| subtopic_is_just_asked(&c.subtopic)) {
-            return Ok(make_directive(
-                pick,
-                QuestionIntent::ReviewMistake,
-                pick.depth,
-                format!(
-                    "Diagnostic probe to confirm or refute shadow hypothesis '{}' ({}%).",
-                    top_hyp.label,
-                    (top_hyp.probability * 100.0).round() as u32
-                ),
-                false,
-                None,
-                Some(top_hyp.label.clone()),
-            ));
-        }
-    }
-
-    // 1B. Contrast question for a strong inhibitory `Confuses` synapse (prefer fresh subtopic)
-    let mut eligible_confs: Vec<(&ConceptEdge, &ConceptNode, String, f64)> = Vec::new();
-    for conf in edges.iter().filter(|e| e.kind == EdgeKind::Confuses && e.weight >= 0.40) {
-        let a = by_slug.get(conf.from_slug.as_str()).copied();
-        let b = by_slug.get(conf.to_slug.as_str()).copied();
-        let target_and_other = match (a, b) {
-            (Some(na), Some(nb)) if candidate_ids.contains(na.id.as_str()) => Some((na, nb.title.clone())),
-            (Some(na), Some(nb)) if candidate_ids.contains(nb.id.as_str()) => Some((nb, na.title.clone())),
-            _ => None,
-        };
-        if let Some((pick, other_title)) = target_and_other {
-            if pick.next_review_at.map_or(true, |ts| ts <= now_ms) {
-                let score = conf.weight + subtopic_diversity_adjustment(&pick.subtopic, recent_trail) * 0.5;
-                eligible_confs.push((conf, pick, other_title, score));
+        eligible_hyps.sort_by(|a, b| b.2.total_cmp(&a.2));
+        if let Some((top_hyp, pick, _)) = eligible_hyps.first() {
+            if !subtopic_is_just_asked(&pick.subtopic)
+                || candidates.iter().all(|c| subtopic_is_just_asked(&c.subtopic))
+            {
+                return Ok(make_directive(
+                    pick,
+                    QuestionIntent::ReviewMistake,
+                    pick.depth,
+                    format!(
+                        "Diagnostic probe to confirm or refute shadow hypothesis '{}' ({}%).",
+                        top_hyp.label,
+                        (top_hyp.probability * 100.0).round() as u32
+                    ),
+                    false,
+                    None,
+                    Some(top_hyp.label.clone()),
+                ));
             }
         }
-    }
-    eligible_confs.sort_by(|a, b| b.3.total_cmp(&a.3));
-    if let Some((conf, pick, other_title, _)) = eligible_confs.first() {
-        if !subtopic_is_just_asked(&pick.subtopic) || candidates.iter().all(|c| subtopic_is_just_asked(&c.subtopic)) {
-            return Ok(make_directive(
-                pick,
-                QuestionIntent::ReviewMistake,
-                pick.depth,
-                format!(
-                    "Contrast question separating '{}' from '{}' (confusion weight {:.2}).",
-                    pick.title, other_title, conf.weight
-                ),
-                false,
-                Some(other_title.clone()),
-                None,
-            ));
-        }
-    }
 
-    // 1C. Due mistake reviews — strongly prefer mistakes from a DIFFERENT subtopic than the last question
-    let mut due_mistakes: Vec<(&ConceptNode, f64)> = candidates
-        .iter()
-        .copied()
-        .filter(|c| {
-            c.status == ConceptStatus::NeedsReview
-                && c.next_review_at.map_or(true, |ts| ts <= now_ms)
-        })
-        .map(|c| {
-            let score = (1.0 - c.mastery) + subtopic_diversity_adjustment(&c.subtopic, recent_trail);
-            (c, score)
-        })
-        .collect();
-    due_mistakes.sort_by(|a, b| b.1.total_cmp(&a.1));
-    if let Some((pick, _)) = due_mistakes.first() {
-        if !subtopic_is_just_asked(&pick.subtopic) || candidates.iter().all(|c| subtopic_is_just_asked(&c.subtopic)) {
-            return Ok(make_directive(
-                pick,
-                QuestionIntent::ReviewMistake,
-                pick.depth,
-                format!("Re-testing '{}' from a fresh angle to clear earlier mistakes.", pick.title),
-                false,
-                None,
-                None,
-            ));
+        // 1B. Contrast question for a strong inhibitory `Confuses` synapse (prefer fresh subtopic)
+        let mut eligible_confs: Vec<(&ConceptEdge, &ConceptNode, String, f64)> = Vec::new();
+        for conf in edges.iter().filter(|e| e.kind == EdgeKind::Confuses && e.weight >= 0.40) {
+            let a = by_slug.get(conf.from_slug.as_str()).copied();
+            let b = by_slug.get(conf.to_slug.as_str()).copied();
+            let target_and_other = match (a, b) {
+                (Some(na), Some(nb)) if candidate_ids.contains(na.id.as_str()) => {
+                    Some((na, nb.title.clone()))
+                }
+                (Some(na), Some(nb)) if candidate_ids.contains(nb.id.as_str()) => {
+                    Some((nb, na.title.clone()))
+                }
+                _ => None,
+            };
+            if let Some((pick, other_title)) = target_and_other {
+                if (!has_fresh_unseen_elsewhere || !is_recently_asked_concept(&pick.id, recent_trail, 3))
+                    && pick.next_review_at.map_or(true, |ts| ts <= now_ms)
+                {
+                    let score = conf.weight
+                        + subtopic_diversity_adjustment(
+                            &pick.subtopic,
+                            &subtopic_attempts,
+                            effective_attempts,
+                            recent_trail,
+                        ) * 0.5;
+                    eligible_confs.push((conf, pick, other_title, score));
+                }
+            }
+        }
+        eligible_confs.sort_by(|a, b| b.3.total_cmp(&a.3));
+        if let Some((conf, pick, other_title, _)) = eligible_confs.first() {
+            if !subtopic_is_just_asked(&pick.subtopic)
+                || candidates.iter().all(|c| subtopic_is_just_asked(&c.subtopic))
+            {
+                return Ok(make_directive(
+                    pick,
+                    QuestionIntent::ReviewMistake,
+                    pick.depth,
+                    format!(
+                        "Contrast question separating '{}' from '{}' (confusion weight {:.2}).",
+                        pick.title, other_title, conf.weight
+                    ),
+                    false,
+                    Some(other_title.clone()),
+                    None,
+                ));
+            }
+        }
+
+        // 1C. Due mistake reviews — strongly prefer mistakes from a DIFFERENT subtopic than the last question
+        let mut due_mistakes: Vec<(&ConceptNode, f64)> = candidates
+            .iter()
+            .copied()
+            .filter(|c| {
+                c.status == ConceptStatus::NeedsReview
+                    && (!has_fresh_unseen_elsewhere || !is_recently_asked_concept(&c.id, recent_trail, 3))
+                    && c.next_review_at.map_or(true, |ts| ts <= now_ms)
+            })
+            .map(|c| {
+                let score = (1.0 - c.mastery)
+                    + subtopic_diversity_adjustment(
+                        &c.subtopic,
+                        &subtopic_attempts,
+                        effective_attempts,
+                        recent_trail,
+                    );
+                (c, score)
+            })
+            .collect();
+        due_mistakes.sort_by(|a, b| b.1.total_cmp(&a.1));
+        if let Some((pick, _)) = due_mistakes.first() {
+            if !subtopic_is_just_asked(&pick.subtopic)
+                || candidates.iter().all(|c| subtopic_is_just_asked(&c.subtopic))
+            {
+                return Ok(make_directive(
+                    pick,
+                    QuestionIntent::ReviewMistake,
+                    pick.depth,
+                    format!("Re-testing '{}' from a fresh angle to clear earlier mistakes.", pick.title),
+                    false,
+                    None,
+                    None,
+                ));
+            }
         }
     }
 
@@ -277,7 +384,17 @@ pub fn select_next_directive(
             matches!(c.status, ConceptStatus::Mastered | ConceptStatus::Deepened)
                 && c.next_review_at.map_or(false, |ts| ts <= now_ms)
         })
-        .map(|c| (c, subtopic_diversity_adjustment(&c.subtopic, recent_trail)))
+        .map(|c| {
+            (
+                c,
+                subtopic_diversity_adjustment(
+                    &c.subtopic,
+                    &subtopic_attempts,
+                    effective_attempts,
+                    recent_trail,
+                ),
+            )
+        })
         .collect();
     due_reinforcements.sort_by(|a, b| b.1.total_cmp(&a.1));
     if let Some((pick, _)) = due_reinforcements.first() {
@@ -294,11 +411,16 @@ pub fn select_next_directive(
     }
 
     // 4. Interleaved Information-Gain Frontier:
-    // Strongly favors UNSEEN & active concepts in FRESH / least-recently-visited subtopics!
+    // Strongly favors UNSEEN & active concepts in FRESH / unexplored pillars!
     let mut frontier: Vec<(f64, &ConceptNode)> = candidates
         .iter()
         .copied()
-        .filter(|c| matches!(c.status, ConceptStatus::Unseen | ConceptStatus::Learning | ConceptStatus::NeedsReview))
+        .filter(|c| {
+            matches!(
+                c.status,
+                ConceptStatus::Unseen | ConceptStatus::Learning | ConceptStatus::NeedsReview
+            )
+        })
         .map(|c| {
             let prereqs_met = edges
                 .iter()
@@ -306,9 +428,14 @@ pub fn select_next_directive(
                 .filter_map(|e| by_slug.get(e.from_slug.as_str()).copied())
                 .all(|p| p.mastery >= 0.55 || p.attempts == 0);
 
-            let diversity = subtopic_diversity_adjustment(&c.subtopic, recent_trail);
-            let unseen_bonus = if c.status == ConceptStatus::Unseen { 0.35 } else { 0.0 };
-            let prereq_bonus = if prereqs_met { 0.35 } else { -0.20 };
+            let diversity = subtopic_diversity_adjustment(
+                &c.subtopic,
+                &subtopic_attempts,
+                effective_attempts,
+                recent_trail,
+            );
+            let unseen_bonus = if c.status == ConceptStatus::Unseen { 0.45 } else { 0.0 };
+            let prereq_bonus = if prereqs_met { 0.30 } else { -0.15 };
             let depth_nudge = -(c.depth as f64) * 0.05;
             let score = c.uncertainty * 1.35 + diversity + unseen_bonus + prereq_bonus + depth_nudge;
             (score, c)
@@ -340,7 +467,14 @@ pub fn select_next_directive(
     let mut sorted: Vec<(&ConceptNode, f64)> = candidates
         .into_iter()
         .map(|c| {
-            let score = c.uncertainty + subtopic_diversity_adjustment(&c.subtopic, recent_trail) - c.mastery * 0.3;
+            let score = c.uncertainty
+                + subtopic_diversity_adjustment(
+                    &c.subtopic,
+                    &subtopic_attempts,
+                    effective_attempts,
+                    recent_trail,
+                )
+                - c.mastery * 0.3;
             (c, score)
         })
         .collect();
@@ -483,18 +617,77 @@ mod tests {
         let p1 = sample_concept("p1", "tension", "Long-Form Tension", "Pattern and form", 3, ConceptStatus::Unseen);
 
         // Last question was in "Rhythm and groove" -> must jump to a different subtopic!
-        let trail = vec![("r1".into(), "Rhythm and groove".into())];
+        let trail = vec![(
+            "r1".into(),
+            "Rhythm and groove".into(),
+            QuestionIntent::Introduce,
+        )];
         let d1 = select_next_directive(&topic, &[r1.clone(), r2.clone(), s1.clone(), p1.clone()], &[], &[], &[], now, &empty, &trail).unwrap();
         assert_ne!(d1.concept.subtopic, "Rhythm and groove");
         assert_eq!(d1.concept.id, "s1");
 
         // Now both Rhythm and Sound were seen -> jumps to "Pattern and form"!
         let trail2 = vec![
-            ("s1".into(), "Sound and space".into()),
-            ("r1".into(), "Rhythm and groove".into()),
+            ("s1".into(), "Sound and space".into(), QuestionIntent::Introduce),
+            ("r1".into(), "Rhythm and groove".into(), QuestionIntent::Introduce),
         ];
         let d2 = select_next_directive(&topic, &[r1, r2, s1, p1], &[], &[], &[], now, &empty, &trail2).unwrap();
         assert_eq!(d2.concept.subtopic, "Pattern and form");
         assert_eq!(d2.concept.id, "p1");
+    }
+
+    #[test]
+    fn throttles_reviews_to_explore_unseen_pillars_and_flags_narrow_map() {
+        let mut topic = sample_topic();
+        topic.total_attempts = 8;
+        let now = 1_000_000;
+        let empty = HashSet::new();
+
+        let mut r1 = sample_concept("r1", "cycle", "Interlocking Cycle Lengths", "Rhythm & Groove", 2, ConceptStatus::NeedsReview);
+        r1.attempts = 4;
+        r1.mastery = 0.15;
+        let mut r2 = sample_concept("r2", "accent", "Accent & Microtiming", "Rhythm & Groove", 1, ConceptStatus::Learning);
+        r2.attempts = 4;
+        let m1 = sample_concept("m1", "eq-carving", "Low-End EQ Carving", "Mixing & Low-End", 1, ConceptStatus::Unseen);
+        let sd1 = sample_concept("sd1", "fm-timbre", "FM & Filter Modulation", "Sound Design & Synthesis", 1, ConceptStatus::Unseen);
+
+        let hyp = MisconceptionNode {
+            id: "h1".into(),
+            topic_id: "t1".into(),
+            slug: "accent-restarts".into(),
+            label: "accent_count_restarts_each_bar".into(),
+            probability: 0.77,
+            evidence_count: 2,
+            refute_count: 0,
+            linked_concepts: vec!["cycle".into()],
+            updated_at: now - 1000,
+        };
+
+        // Immediately after a ReviewMistake, scheduler must pivot to an unexplored pillar (Mixing or Sound Design)
+        let trail = vec![(
+            "r2".into(),
+            "Rhythm & Groove".into(),
+            QuestionIntent::ReviewMistake,
+        )];
+        let d = select_next_directive(
+            &topic,
+            &[r1, r2, m1, sd1],
+            &[],
+            &[hyp],
+            &[],
+            now,
+            &empty,
+            &trail,
+        )
+        .unwrap();
+        assert_eq!(d.intent, QuestionIntent::Introduce);
+        assert!(
+            d.concept.subtopic == "Mixing & Low-End"
+                || d.concept.subtopic == "Sound Design & Synthesis",
+            "expected unexplored non-rhythm pillar, got {}",
+            d.concept.subtopic
+        );
+        // Narrow 4-concept / 3-pillar map after 8 attempts must request automatic broadening
+        assert!(d.requires_new_concepts);
     }
 }

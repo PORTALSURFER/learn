@@ -93,8 +93,8 @@ pub fn concept_map_schema() -> Value {
         "properties": {
             "concepts": {
                 "type": "array",
-                "minItems": 4,
-                "maxItems": 10,
+                "minItems": 6,
+                "maxItems": 18,
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
@@ -157,7 +157,7 @@ pub fn media_object_schema() -> Value {
             "leftPoints": { "type": "array", "items": { "type": "string" } },
             "rightTitle": { "type": "string" },
             "rightPoints": { "type": "array", "items": { "type": "string" } },
-            "voice": { "type": "string", "enum": ["synth", "rim_click", "kick_bass", "delay"] },
+            "voice": { "type": "string", "enum": ["synth", "rim_click", "kick_bass", "delay", "reverb_rumble", "saturation"] },
             "bpm": { "type": "number" },
             "baseHz": { "type": "number" },
             "cutoffStartHz": { "type": "number" },
@@ -675,7 +675,9 @@ fn convert_raw_media(m: RawMedia) -> Option<ExampleMedia> {
             reveal,
             spec: AudioDemoSpec {
                 voice: match m.voice.trim().to_lowercase().as_str() {
-                    "rim_click" | "kick_bass" | "delay" | "synth" => m.voice.trim().to_lowercase(),
+                    "rim_click" | "kick_bass" | "delay" | "synth" | "reverb_rumble" | "saturation" => {
+                        m.voice.trim().to_lowercase()
+                    }
                     _ => "synth".into(),
                 },
                 bpm: if m.bpm > 40.0 { m.bpm } else { 128.0 },
@@ -753,27 +755,37 @@ pub fn build_concept_map_prompt(
     topic_title: &str,
     level: SkillLevel,
     existing_titles: &[String],
+    existing_subtopics: &[String],
     min_depth: u8,
 ) -> String {
     let scope_note = if existing_titles.is_empty() {
         format!(
-            "Create 8-10 concepts (depths 1 to 3) spread EVENLY across 4 DISTINCT subtopics (2-3 concepts per subtopic, with at least one depth 1-2 entry concept in every subtopic) covering the full breadth of \"{topic_title}\" for a {} learner.",
+            "Create 12-16 concepts (depths 1 to 3) spread EVENLY across 5-6 DISTINCT major pillars/disciplines of \"{topic_title}\" (2-3 concepts per pillar, with at least one depth 1-2 entry concept in EVERY pillar) for a {} learner.\n\
+             CRITICAL BREADTH RULE: Cover the FULL multidisciplinary scope of \"{topic_title}\" — NEVER cluster into just one narrow facet! For example, a music production topic MUST span distinct pillars such as Sound Design & Synthesis, Mixing & EQ/Dynamics, Low-End & Kick/Bass Engineering, Rhythm & Groove, Space/FX & Atmospheres, and Arrangement & Club Energy (adapt the 5-6 pillars naturally to whatever domain \"{topic_title}\" is).",
             level.as_str()
         )
     } else {
+        let subtopic_list = if existing_subtopics.is_empty() {
+            "none yet".to_string()
+        } else {
+            existing_subtopics.join(", ")
+        };
         format!(
-            "Already covered concepts (DO NOT repeat these; generate 6 deeper next-level concepts at depth {min_depth}-4 and link prerequisites in `requires`): {}.",
+            "Existing subtopics/pillars in the map: {subtopic_list}.\n\
+             Already covered concepts (DO NOT repeat these): {}.\n\
+             Generate 6-10 NEW concepts.\n\
+             CRITICAL BREADTH-FIRST AUDIT: First identify major pillars/disciplines of \"{topic_title}\" that are MISSING or underrepresented above (for example, in music production: Sound Design & Synthesis, Mixing & EQ, Compression & Dynamics, Reverb/Rumble/FX & Spatial Depth, Arrangement & Transitions, Mastering/Club Translation — tailored to \"{topic_title}\"). Create depth 1-2 entry concepts in those missing pillars first! Only add depth {min_depth}-4 deeper concepts when all major pillars of \"{topic_title}\" are already well covered.",
             existing_titles.join(", ")
         )
     };
 
     format!(
-        "You are an expert adaptive tutor building a Cognitive Mesh Knowledge Map for \"{topic_title}\".\n\
+        "You are an expert adaptive tutor building a multidisciplinary Cognitive Mesh Knowledge Map for \"{topic_title}\".\n\
          {scope_note}\n\
          For depth 2-4 concepts, include 1-2 prerequisite concept titles in `requires` (empty array [] for depth 1).\n\
          Return ONLY a valid JSON object matching:\n\
          {{\"concepts\":[{{\"title\":\"...\",\"subtopic\":\"...\",\"summary\":\"1-sentence core mental model\",\"depth\":1,\"requires\":[]}}]}}\n\
-         Keep titles concise (2-5 words), group subtopics into 2-4 themes, and make every summary crisp and accurate."
+         Keep titles concise (2-5 words), use 5-6 clean, distinct pillar names in `subtopic`, and make every summary crisp and accurate."
     )
 }
 
@@ -845,22 +857,26 @@ pub fn build_question_prompt(directive: &SchedulerDirective) -> String {
         );
 
     lines.push("Pedagogical & Anti-Confusion Rules (CRITICAL):".into());
+    lines.push(format!(
+        "- DISCIPLINE FIDELITY (CRITICAL): Stay 100% faithful to the target concept's actual pillar (`{}`) and subject matter. NEVER twist a sound design, synthesis, mixing, EQ, compression, saturation, reverb/space, arrangement, or theory concept into a step-sequencer accent or rim-click timing puzzle!",
+        directive.concept.subtopic
+    ));
     lines.push("- Write in crystal-clear, concrete, everyday language matched to the learner's level. Briefly define any domain jargon inline.".into());
     lines.push("- `goal`: 1 crisp plain-English sentence explaining the HUMAN, EMOTIONAL, PERCEPTUAL, or PRACTICAL WHY first—why a real practitioner wants this effect in the first place.".into());
     if needs_primer {
-        lines.push("- `primer`: REQUIRED here (learner is new to or struggling with this concept). Write 1-2 short, intuitive sentences TEACHING the core mental model BEFORE the question (e.g. 'An accent works by contrast—one hit pops out only when the hits around it stay softer.'). Teach the principle cleanly WITHOUT spoiling the exact answer letter.".into());
+        lines.push("- `primer`: REQUIRED here (learner is new to or struggling with this concept). Write 1-2 short, intuitive sentences TEACHING the core mental model BEFORE the question (e.g. 'High-pass filtering clears mud by cutting low frequencies from non-bass elements so the kick and sub have room.'). Teach the principle cleanly WITHOUT spoiling the exact answer letter.".into());
     } else {
         lines.push("- `primer`: Return empty string \"\" since the learner already has solid mastery and should recall unassisted.".into());
     }
     lines.push("- `prompt`: Keep it effortless to grok on the FIRST read! State ONE clean starting setup + ONE clear question. NEVER include decoy backstories (like 'you try a second loop') that confuse what the learner is editing.".into());
-    lines.push("- EXPLICIT CONSTRAINT RULE (zero ambiguity): Every single constraint used to reject ANY distractor (e.g., 'while keeping all timing locked on the grid', 'using loudness only', 'without changing pitch') MUST be stated explicitly inside `prompt`. Never penalize an option for breaking an unmentioned constraint!".into());
+    lines.push("- EXPLICIT CONSTRAINT RULE (zero ambiguity): Every single constraint used to reject ANY distractor (e.g., 'without changing the melody', 'using EQ only', 'keeping the kick transient intact') MUST be stated explicitly inside `prompt`. Never penalize an option for breaking an unmentioned constraint!".into());
     lines.push("- CHOICES: Keep each of the 4 choices SHORT (<= 14 words), concrete, and parallel in structure, varying ONE clear dimension at a time. Exactly 1 unambiguously right answer and 3 clearly distinct distractors (never 'All of the above').".into());
     lines.push("- `hint`: 1 crisp sentence nudging the learner toward the mental model WITHOUT revealing the correct choice.".into());
-    lines.push("- `media`: ACTIVELY include a concrete supporting example (`reveal: \"before_answer\"` by default!) so the learner can SEE, HEAR, or FEEL the starting setup before answering—without spoiling which option A-D is correct:".into());
-    lines.push("  * `audio`: STRONGLY PREFERRED for music, sound design, rhythm, groove, or acoustics! Choose `voice` ('rim_click', 'kick_bass', 'delay', or 'synth'). Put the ORIGINAL starting sound in `values` (4-16 floats with strong visual contrast, e.g. accent >= 0.90 vs regular <= 0.35) + `labels`, and put the TARGET/CORRECT sound in `afterValues`. ALSO populate `correctAudioEffect` AND every distractor's `audioEffect` (`stepLevels`, `cutoffStartHz`/`cutoffEndHz`, `accentStep`, `nudgeMs`, `gainScale`, `pitchShiftSemis`, `wetEffect`: 'default'|'dry'|'wet') so selecting ANY answer A-D plays back what THAT specific edit would actually sound like! For non-audio questions, leave `audioEffect` fields empty/0/'default'.".into());
-    lines.push("  * `curve`: 4-16 normalized values (0.0..1.0 with clear visual contrast) + concise labels — ideal for filter/energy curves, step velocity grids, math functions, growth curves, or envelopes.".into());
-    lines.push("  * `flow`: 2-5 connected `flowSteps` (`label`, `note`) — ideal for signal chains, protocols, lifecycles, causal steps, or pipelines.".into());
-    lines.push("  * `contrast`: side-by-side comparison (`leftTitle`/`leftPoints` vs `rightTitle`/`rightPoints`) — ideal for clarifying two competing forces.".into());
+    lines.push("- `media`: ACTIVELY include the BEST supporting example (`reveal: \"before_answer\"` by default!) matched to THIS concept's discipline—without spoiling which option A-D is correct:".into());
+    lines.push("  * `audio`: Great for sonic concepts! Match `voice` to the discipline: `synth` (synthesis, timbre, filter cutoff/modulation), `kick_bass` (low-end balance, sidechain/ducking, sub clarity), `reverb_rumble` (dark club space, reverb tails, techno rumble), `saturation` (harmonics, overdrive, analog warmth/grit), `delay` (echo/dub space), and `rim_click` ONLY when the concept is genuinely about percussion/timing/accents. Put the ORIGINAL starting sound in `values` + `labels`, and TARGET in `afterValues`. Populate `correctAudioEffect` AND every distractor's `audioEffect` (`stepLevels`, `cutoffStartHz`/`cutoffEndHz`, `accentStep`, `nudgeMs`, `gainScale`, `pitchShiftSemis`, `wetEffect`: 'default'|'dry'|'wet') so picking ANY option A-D auditions what that edit sounds like! For non-audio questions, leave `audioEffect` fields empty/0/'default'.".into());
+    lines.push("  * `curve`: 4-16 normalized values (0.0..1.0 with clear visual contrast) + concise labels — ideal for EQ frequency curves, ADSR envelopes, filter sweeps, compression gain reduction, arrangement energy arcs, or math plots.".into());
+    lines.push("  * `flow`: 2-5 connected `flowSteps` (`label`, `note`) — ideal for mixing/synthesis signal chains (e.g. Osc -> Filter -> Saturation -> Send Reverb), routing buses, protocols, or causal pipelines.".into());
+    lines.push("  * `contrast`: side-by-side comparison (`leftTitle`/`leftPoints` vs `rightTitle`/`rightPoints`) — ideal for mixing/sound-design trade-offs (e.g. Insert vs Send FX, Mono Sub vs Wide Highs, Subtractive vs FM).".into());
     lines.push("  * `interactive_html`: a compact self-contained offline HTML/SVG/Canvas/WebAudio interactive toy (dark `#040405`, white `#F4F4F6`, red `#E11D2E`, zero external CDNs) when a live interactive sandbox makes the concept click instantly.".into());
     lines.push("  * `none`: Use ONLY when a visual/audio/interactive example truly adds zero clarity.".into());
     lines.push("- For EACH distractor, provide `trapKind` ('confuses_concept' | 'misconception' | 'careless'), `trapTarget`, and `whyWrong` (1 crisp sentence explaining what picking THAT specific option would actually feel like or cause instead of the stated goal).".into());
@@ -876,12 +892,21 @@ pub fn build_clarifying_prompt(
     concept_title: &str,
     question_prompt: &str,
     learner_question: &str,
+    existing_subtopics: &[String],
     already_answered: bool,
 ) -> String {
     let spoiler_rule = if already_answered {
         "The learner has already answered the quiz question, so you may reference the solution freely."
     } else {
         "IMPORTANT: The learner has NOT answered the quiz question yet. Explain the concept or term they asked about clearly WITHOUT revealing or hinting which multiple-choice option is correct."
+    };
+    let pillar_hint = if existing_subtopics.is_empty() {
+        "Choose a broad discipline pillar name (not a 1-concept micro-label).".to_string()
+    } else {
+        format!(
+            "Prefer reusing one of the topic's existing broad pillar names ({}) instead of inventing a narrow 1-concept subtopic.",
+            existing_subtopics.join(", ")
+        )
     };
 
     format!(
@@ -893,7 +918,7 @@ pub fn build_clarifying_prompt(
          Tasks:\n\
          1. `answer`: Give a super clear, friendly 2-3 sentence plain-English explanation answering the learner's question specifically in the context of \"{topic_title}\".\n\
          2. Identify if this question reveals a missing foundational term or concept (`hasKnowledgeGap`: true/false) that we should add to their Cognitive Mesh so future multiple-choice questions teach and reinforce it (always tied back to \"{topic_title}\").\n\
-         3. If `hasKnowledgeGap` is true, provide concise `conceptTitle` (2-4 words), `conceptSubtopic`, `conceptSummary` (1 crisp sentence tied to \"{topic_title}\"), `conceptDepth` (usually 1 for foundational terms), and `gapNote` (1 short sentence summarizing what the learner was unsure about).\n\
+         3. If `hasKnowledgeGap` is true, provide concise `conceptTitle` (2-4 words), `conceptSubtopic` ({pillar_hint}), `conceptSummary` (1 crisp sentence tied to \"{topic_title}\"), `conceptDepth` (usually 1 for foundational terms), and `gapNote` (1 short sentence summarizing what the learner was unsure about).\n\
          Return ONLY valid JSON matching the schema.",
         level.as_str()
     )
@@ -1038,12 +1063,19 @@ impl AiRunner {
         level: SkillLevel,
         cfg: &RunnerConfig,
         existing_titles: &[String],
+        existing_subtopics: &[String],
         min_depth: u8,
     ) -> Result<Vec<ConceptInput>> {
         if cfg.kind == RunnerKind::Demo {
             return Ok(demo_concepts(topic_title, existing_titles, min_depth));
         }
-        let prompt = build_concept_map_prompt(topic_title, level, existing_titles, min_depth);
+        let prompt = build_concept_map_prompt(
+            topic_title,
+            level,
+            existing_titles,
+            existing_subtopics,
+            min_depth,
+        );
         let json_val = self.run_json_prompt(&prompt, &concept_map_schema(), cfg)?;
         parse_concept_map(json_val)
     }
@@ -1068,6 +1100,7 @@ impl AiRunner {
         concept_title: &str,
         question_prompt: &str,
         learner_question: &str,
+        existing_subtopics: &[String],
         already_answered: bool,
         cfg: &RunnerConfig,
     ) -> Result<ClarifyingAnalysis> {
@@ -1079,7 +1112,10 @@ impl AiRunner {
                 ),
                 missing_concept: Some(ConceptInput {
                     title: term.clone(),
-                    subtopic: "Foundations".into(),
+                    subtopic: existing_subtopics
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "Foundations".into()),
                     summary: format!("Core meaning and role of {term} inside {topic_title}."),
                     depth: 1,
                     requires: vec![],
@@ -1093,6 +1129,7 @@ impl AiRunner {
             concept_title,
             question_prompt,
             learner_question,
+            existing_subtopics,
             already_answered,
         );
         let json_val = self.run_json_prompt(&prompt, &clarifying_schema(), cfg)?;
@@ -1328,6 +1365,27 @@ fn demo_concepts(topic: &str, existing: &[String], min_depth: u8) -> Vec<Concept
             requires: vec!["Step-by-Step Lifecycle".into()],
         },
         ConceptInput {
+            title: "Design & Shaping Craft".into(),
+            subtopic: "Design & Synthesis".into(),
+            summary: format!("How raw elements are sculpted and modulated into cohesive {t} output."),
+            depth: 1,
+            requires: vec![],
+        },
+        ConceptInput {
+            title: "Balance & Clarity".into(),
+            subtopic: "Tuning & Mixing".into(),
+            summary: format!("How competing layers are separated and balanced for clean {t} results."),
+            depth: 1,
+            requires: vec![],
+        },
+        ConceptInput {
+            title: "Depth & Spatial Context".into(),
+            subtopic: "Space & Atmosphere".into(),
+            summary: format!("How environment, layering, and subtle movement add depth in {t}."),
+            depth: 2,
+            requires: vec!["Design & Shaping Craft".into()],
+        },
+        ConceptInput {
             title: "Trade-offs & Constraints".into(),
             subtopic: "Architecture".into(),
             summary: format!("Balancing speed, simplicity, and correctness in {t}."),
@@ -1343,10 +1401,10 @@ fn demo_concepts(topic: &str, existing: &[String], min_depth: u8) -> Vec<Concept
         },
         ConceptInput {
             title: "Diagnostics & Verification".into(),
-            subtopic: "Practice".into(),
+            subtopic: "Tuning & Mixing".into(),
             summary: format!("How to observe, measure, and debug {t} systematically."),
-            depth: 3,
-            requires: vec!["Common Failure Modes".into()],
+            depth: 2,
+            requires: vec!["Balance & Clarity".into()],
         },
         ConceptInput {
             title: "Subtle Edge Cases".into(),
@@ -1359,7 +1417,7 @@ fn demo_concepts(topic: &str, existing: &[String], min_depth: u8) -> Vec<Concept
     let existing_lower: HashSet<String> = existing.iter().map(|s| s.to_lowercase()).collect();
     templates
         .into_iter()
-        .filter(|c| !existing_lower.contains(&c.title.to_lowercase()) && c.depth >= min_depth)
+        .filter(|c| !existing_lower.contains(&c.title.to_lowercase()) && (existing.is_empty() || c.depth >= min_depth || c.depth <= 2))
         .collect()
 }
 

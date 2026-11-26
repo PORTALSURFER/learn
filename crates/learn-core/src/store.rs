@@ -1047,16 +1047,17 @@ impl KnowledgeStore {
         Ok(set)
     }
 
-    /// Returns the most recent `(concept_id, subtopic)` pairs across both open buffered
-    /// and recently answered questions (newest first) so the scheduler interleaves subtopics.
+    /// Returns the most recent `(concept_id, subtopic, intent)` tuples across both open buffered
+    /// and recently answered questions (newest first) so the scheduler interleaves subtopics and
+    /// throttles back-to-back mistake reviews.
     pub fn list_recent_question_trail(
         &self,
         topic_id: &str,
         limit: usize,
-    ) -> Result<Vec<(String, String)>> {
+    ) -> Result<Vec<(String, String, QuestionIntent)>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT q.concept_id, c.subtopic
+            SELECT q.concept_id, c.subtopic, q.intent
             FROM questions q
             JOIN concepts c ON c.id = q.concept_id
             WHERE q.topic_id = ?1
@@ -1065,7 +1066,12 @@ impl KnowledgeStore {
             "#,
         )?;
         let rows = stmt.query_map(params![topic_id, limit as i64], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            let intent_str: String = r.get(2)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                QuestionIntent::from_str(&intent_str),
+            ))
         })?;
         let mut out = Vec::new();
         for r in rows {
@@ -1102,6 +1108,41 @@ impl KnowledgeStore {
             params![topic_id, concept_id],
         )?;
         Ok(changed)
+    }
+
+    /// Removes stale unanswered buffered questions for a topic (e.g., after broadening the map
+    /// with new pillars), while preserving any open questions whose `concept_id` is in `keep_concept_ids`.
+    pub fn delete_open_questions_for_topic(
+        &self,
+        topic_id: &str,
+        keep_concept_ids: &HashSet<String>,
+    ) -> Result<usize> {
+        if keep_concept_ids.is_empty() {
+            let changed = self.conn.execute(
+                "DELETE FROM questions WHERE topic_id = ?1 AND answered_at IS NULL",
+                params![topic_id],
+            )?;
+            return Ok(changed);
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, concept_id FROM questions WHERE topic_id = ?1 AND answered_at IS NULL",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params![topic_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        let mut deleted = 0usize;
+        for (qid, cid) in rows {
+            if !keep_concept_ids.contains(&cid) {
+                deleted += self
+                    .conn
+                    .execute("DELETE FROM questions WHERE id = ?1", params![qid])?;
+            }
+        }
+        Ok(deleted)
     }
 
     pub fn delete_open_questions_by_source(

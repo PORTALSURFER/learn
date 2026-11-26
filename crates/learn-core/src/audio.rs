@@ -163,6 +163,83 @@ pub fn synthesize_audio_wav_bars(
                 add_four_on_floor_kick(&mut samples, bar_sec, total_bars);
             }
         }
+        "reverb_rumble" => {
+            // Punchy 4-on-the-floor kick + dark low-passed club reverb rumble tail in wet/after mode
+            add_four_on_floor_kick(&mut samples, bar_sec, total_bars);
+            if !effective_dry {
+                let beat_sec = bar_sec / 4.0;
+                let cutoff = spec.cutoff_end_hz.clamp(95.0, 2200.0);
+                let rc = 1.0 / (2.0 * PI * cutoff);
+                let dt = 1.0 / SAMPLE_RATE as f32;
+                let alpha = (dt / (rc + dt)).clamp(0.004, 0.92);
+                let mut lp1 = 0.0f32;
+                let mut lp2 = 0.0f32;
+                let mut sub_phase = 0.0f32;
+                let tap1 = ((beat_sec * 0.37) * SAMPLE_RATE as f32) as usize;
+                let tap2 = ((beat_sec * 0.63) * SAMPLE_RATE as f32) as usize;
+                let mut rumble_buf = vec![0.0f32; total_samples];
+
+                for i in 0..total_samples {
+                    let t = i as f32 / SAMPLE_RATE as f32;
+                    let beat_pos = (t / beat_sec).fract();
+                    // Duck rumble under the kick transient, swell between kicks
+                    let duck = (beat_pos * 4.2).clamp(0.0, 1.0).powf(1.5) * (1.0 - beat_pos * 0.18);
+                    let src = samples[i]
+                        + if i >= tap1 { rumble_buf[i - tap1] * 0.42 } else { 0.0 }
+                        + if i >= tap2 { rumble_buf[i - tap2] * 0.32 } else { 0.0 }
+                        + next_noise() * 0.14;
+                    lp1 += alpha * (src - lp1);
+                    lp2 += alpha * (lp1 - lp2);
+                    sub_phase = (sub_phase + (base_hz.clamp(42.0, 75.0)) / SAMPLE_RATE as f32).fract();
+                    let sub_body = (2.0 * PI * sub_phase).sin() * 0.22;
+                    let r = (lp2 * 1.45 + sub_body) * duck;
+                    rumble_buf[i] = r;
+                    samples[i] += r * 0.65;
+                }
+            }
+        }
+        "saturation" => {
+            // Hypnotic bass/lead tone comparing clean vs warm harmonically driven saturation + filter
+            let sixteenth_sec = bar_sec / 16.0;
+            let notes: [f32; 8] = [0.0, 0.0, 3.0, 0.0, 7.0, 5.0, 3.0, 0.0];
+            let mut phase = 0.0f32;
+            let mut lp = 0.0f32;
+            let cutoff_start = spec.cutoff_start_hz.clamp(160.0, 10_000.0);
+            let cutoff_end = if effective_dry {
+                cutoff_start
+            } else {
+                spec.cutoff_end_hz.clamp(180.0, 12_000.0)
+            };
+            let cycle_samples = ((2.0 * bar_sec * SAMPLE_RATE as f32) as usize).max(1);
+            let drive = if effective_dry { 1.0 } else { 4.2 };
+
+            for i in 0..total_samples {
+                let t = i as f32 / SAMPLE_RATE as f32;
+                let progress = (i % cycle_samples) as f32 / (cycle_samples as f32);
+                let step_f = t / (sixteenth_sec * 2.0);
+                let step_idx = (step_f as usize) % notes.len();
+                let step_pos = step_f.fract();
+                let freq = base_hz * 2.0f32.powf(notes[step_idx] / 12.0);
+                phase = (phase + freq / SAMPLE_RATE as f32).fract();
+                let env = (step_pos * 20.0).min(1.0) * (-step_pos * 3.2).exp();
+                let raw = ((2.0 * PI * phase).sin() * 0.65 + (2.0 * phase - 1.0) * 0.35) * env;
+                let driven = if effective_dry {
+                    raw * 0.45
+                } else {
+                    // Asymmetric soft-clip warmth creating rich even + odd harmonics
+                    ((raw * drive + 0.08 * raw * raw * drive).tanh()) * 0.42
+                };
+                let cutoff = cutoff_start * (cutoff_end / cutoff_start).powf(progress);
+                let rc = 1.0 / (2.0 * PI * cutoff);
+                let dt = 1.0 / SAMPLE_RATE as f32;
+                let alpha = (dt / (rc + dt)).clamp(0.005, 0.99);
+                lp += alpha * (driven - lp);
+                samples[i] += lp;
+            }
+            if spec.include_drums {
+                add_four_on_floor_kick(&mut samples, bar_sec, total_bars);
+            }
+        }
         _ => {
             // Default: hypnotic 1-bar repeating synth motif with low-pass filter sweep + optional drums
             let motif_pattern: [Option<f32>; 16] = [
@@ -313,7 +390,14 @@ mod tests {
 
     #[test]
     fn synthesizes_valid_pcm_wav_for_rim_click_and_filter_examples() {
-        for voice in ["synth", "rim_click", "kick_bass", "delay"] {
+        for voice in [
+            "synth",
+            "rim_click",
+            "kick_bass",
+            "delay",
+            "reverb_rumble",
+            "saturation",
+        ] {
             let spec = AudioDemoSpec {
                 voice: voice.into(),
                 bpm: 130.0,

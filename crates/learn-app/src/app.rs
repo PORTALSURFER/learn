@@ -975,7 +975,7 @@ impl LearnApp {
         let service = self.service.clone();
         self.error_banner = None;
         self.busy_message = Some(format!(
-            "Asking {} to deepen your Cognitive Mesh Knowledge Map...",
+            "Asking {} to broaden missing pillars & deepen your Cognitive Mesh...",
             user.runner.label()
         ));
         self.ensure_anim_loop(cx);
@@ -992,8 +992,14 @@ impl LearnApp {
                 match res {
                     Ok(map) => {
                         view.knowledge_map = Some(map);
+                        view.current_question = None;
+                        view.selected_choice_id = None;
+                        view.last_answer = None;
                         view.refresh_topics();
-                        view.info_banner = Some("Added deeper concepts and prerequisite edges.".into());
+                        view.trigger_background_prefetch(cx);
+                        view.info_banner = Some(
+                            "Broadened your Cognitive Mesh with new pillars & refreshed the question queue.".into(),
+                        );
                     }
                     Err(err) => {
                         view.error_banner = Some(err.to_string());
@@ -4234,7 +4240,7 @@ impl LearnApp {
                                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                         this.expand_map(cx);
                                     }))
-                                    .child("+ Expand Deeper Concepts"),
+                                    .child("+ Broaden & Deepen Map"),
                             )
                             .child(
                                 div()

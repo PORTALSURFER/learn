@@ -151,7 +151,10 @@ impl LearnService {
             .create_topic(&user.id, title, level)?;
 
         let cfg = runner_cfg_for(user);
-        let concepts = match self.runner.generate_concept_map(&topic.title, level, &cfg, &[], 1) {
+        let concepts = match self
+            .runner
+            .generate_concept_map(&topic.title, level, &cfg, &[], &[], 1)
+        {
             Ok(c) => c,
             Err(err) => {
                 let _ = self.store.lock().unwrap().delete_topic(&topic.id, &user.id);
@@ -362,7 +365,7 @@ impl LearnService {
             return Err(anyhow!("Type a question first."));
         }
 
-        let (topic, question, current_concept) = {
+        let (topic, question, current_concept, existing_subtopics) = {
             let store = self.store.lock().unwrap();
             let topic = store
                 .get_topic(topic_id, &user.id)?
@@ -373,7 +376,8 @@ impl LearnService {
             let concept = store
                 .get_concept(&question.concept_id)?
                 .ok_or_else(|| anyhow!("Concept not found"))?;
-            (topic, question, concept)
+            let subtopics = distinct_subtopics(&store.list_concepts(topic_id)?);
+            (topic, question, concept, subtopics)
         };
 
         let cfg = runner_cfg_for(user);
@@ -383,6 +387,7 @@ impl LearnService {
             &current_concept.title,
             &question.prompt,
             clean_q,
+            &existing_subtopics,
             already_answered,
             &cfg,
         )?;
@@ -480,15 +485,16 @@ impl LearnService {
     }
 
     pub fn expand_knowledge_map(&self, user: &User, topic_id: &str) -> Result<KnowledgeMap> {
-        let (topic, existing_titles, next_depth) = {
+        let (topic, existing_titles, existing_subtopics, next_depth) = {
             let store = self.store.lock().unwrap();
             let topic = store
                 .get_topic(topic_id, &user.id)?
                 .ok_or_else(|| anyhow!("Topic not found"))?;
             let concepts = store.list_concepts(topic_id)?;
             let titles: Vec<String> = concepts.iter().map(|c| c.title.clone()).collect();
+            let subtopics = distinct_subtopics(&concepts);
             let max_depth = concepts.iter().map(|c| c.depth).max().unwrap_or(1);
-            (topic, titles, (max_depth + 1).min(4))
+            (topic, titles, subtopics, (max_depth + 1).min(4))
         };
 
         let cfg = runner_cfg_for(user);
@@ -497,12 +503,15 @@ impl LearnService {
             topic.level,
             &cfg,
             &existing_titles,
+            &existing_subtopics,
             next_depth,
         )?;
-        self.store
-            .lock()
-            .unwrap()
-            .upsert_concepts(topic_id, &new_concepts)?;
+        {
+            let store = self.store.lock().unwrap();
+            store.upsert_concepts(topic_id, &new_concepts)?;
+            // Refresh stale unanswered buffer so newly added pillars show up immediately.
+            let _ = store.delete_open_questions_for_topic(topic_id, &HashSet::new());
+        }
         self.get_knowledge_map(&user.id, topic_id)
     }
 
@@ -521,7 +530,7 @@ impl LearnService {
             let edges = store.list_edges(topic_id)?;
             let misconceptions = store.list_misconceptions(topic_id)?;
             let anchors = store.list_cross_topic_anchors(&user.id, topic_id, 4)?;
-            let recent_trail = store.list_recent_question_trail(topic_id, 6)?;
+            let recent_trail = store.list_recent_question_trail(topic_id, 8)?;
             (topic, concepts, edges, misconceptions, anchors, recent_trail)
         };
 
@@ -530,7 +539,7 @@ impl LearnService {
         if concepts.is_empty() {
             let initial = self
                 .runner
-                .generate_concept_map(&topic.title, topic.level, &cfg, &[], 1)?;
+                .generate_concept_map(&topic.title, topic.level, &cfg, &[], &[], 1)?;
             let store = self.store.lock().unwrap();
             concepts = store.upsert_concepts(topic_id, &initial)?;
             edges = store.list_edges(topic_id)?;
@@ -549,16 +558,20 @@ impl LearnService {
 
         if directive.requires_new_concepts {
             let existing_titles: Vec<String> = concepts.iter().map(|c| c.title.clone()).collect();
+            let existing_subtopics = distinct_subtopics(&concepts);
             if let Ok(deeper) = self.runner.generate_concept_map(
                 &topic.title,
                 topic.level,
                 &cfg,
                 &existing_titles,
+                &existing_subtopics,
                 directive.target_depth,
             ) {
                 if !deeper.is_empty() {
                     let store = self.store.lock().unwrap();
                     if let Ok(updated_concepts) = store.upsert_concepts(topic_id, &deeper) {
+                        // Drop stale buffered questions not currently displayed so fresh pillars enter immediately.
+                        let _ = store.delete_open_questions_for_topic(topic_id, exclude_ids);
                         let updated_edges = store.list_edges(topic_id).unwrap_or(edges);
                         if let Ok(next_dir) = select_next_directive(
                             &topic,
@@ -596,6 +609,18 @@ impl LearnService {
 
         Ok(stored)
     }
+}
+
+fn distinct_subtopics(concepts: &[crate::models::ConceptNode]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for c in concepts {
+        let trimmed = c.subtopic.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_lowercase()) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
 }
 
 fn runner_cfg_for(user: &User) -> RunnerConfig {
