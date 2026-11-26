@@ -316,6 +316,26 @@ pub struct ConceptNode {
     pub next_review_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChoiceAudioEffect {
+    #[serde(default)]
+    pub step_levels: Vec<f32>,
+    #[serde(default)]
+    pub cutoff_start_hz: f32,
+    #[serde(default)]
+    pub cutoff_end_hz: f32,
+    #[serde(default)]
+    pub accent_step: Option<u8>,
+    #[serde(default)]
+    pub nudge_ms: f32,
+    #[serde(default)]
+    pub gain_scale: f32,
+    #[serde(default)]
+    pub pitch_shift_semis: f32,
+    #[serde(default)]
+    pub wet_effect: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionChoice {
     pub id: String, // "A" | "B" | "C" | "D"
@@ -328,6 +348,9 @@ pub struct QuestionChoice {
     /// Specific reason why choosing this distractor fails or creates the wrong effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why_wrong: Option<String>,
+    /// Optional audio edit simulation so clicking this choice plays what it would sound like!
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_effect: Option<ChoiceAudioEffect>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,6 +413,52 @@ pub struct AudioDemoSpec {
     pub before_label: Option<String>,
     #[serde(default)]
     pub after_label: Option<String>,
+    /// Overall gain multiplier (default 1.0) & pitch offset in semitones (default 0.0) for choice auditioning.
+    #[serde(default = "default_gain_scale")]
+    pub gain_scale: f32,
+    #[serde(default)]
+    pub pitch_shift_semis: f32,
+    /// Explicit override for dry/wet DSP voices (`delay`, `kick_bass`).
+    #[serde(default)]
+    pub force_wet: Option<bool>,
+}
+
+fn default_gain_scale() -> f32 {
+    1.0
+}
+
+impl AudioDemoSpec {
+    /// Applies a choice's `ChoiceAudioEffect` on top of the original starting loop so the learner
+    /// hears and sees exactly what picking that answer would do.
+    pub fn with_choice_effect(&self, effect: &ChoiceAudioEffect) -> AudioDemoSpec {
+        let mut out = self.clone();
+        if !effect.step_levels.is_empty() {
+            out.step_levels = effect.step_levels.clone();
+            out.after_step_levels = effect.step_levels.clone();
+        }
+        if effect.cutoff_start_hz > 60.0 {
+            out.cutoff_start_hz = effect.cutoff_start_hz;
+        }
+        if effect.cutoff_end_hz > 60.0 {
+            out.cutoff_end_hz = effect.cutoff_end_hz;
+        }
+        if let Some(step) = effect.accent_step {
+            out.accent_step = Some(step);
+        }
+        if effect.nudge_ms.abs() > 0.1 {
+            out.nudge_ms = effect.nudge_ms;
+        }
+        if effect.gain_scale > 0.05 {
+            out.gain_scale = effect.gain_scale.clamp(0.25, 1.8);
+        }
+        if effect.pitch_shift_semis.abs() > 0.05 {
+            out.pitch_shift_semis = effect.pitch_shift_semis.clamp(-12.0, 12.0);
+        }
+        if let Some(wet) = effect.wet_effect {
+            out.force_wet = Some(wet);
+        }
+        out
+    }
 }
 
 fn default_voice() -> String {

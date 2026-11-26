@@ -21,7 +21,17 @@ pub fn synthesize_audio_wav_bars(
     out_path: &Path,
 ) -> Result<PathBuf> {
     let bpm = spec.bpm.clamp(70.0, 170.0);
-    let base_hz = spec.base_hz.clamp(45.0, 880.0);
+    let pitch_ratio = 2.0f32.powf(spec.pitch_shift_semis.clamp(-12.0, 12.0) / 12.0);
+    let base_hz = (spec.base_hz.clamp(45.0, 880.0) * pitch_ratio).clamp(35.0, 1400.0);
+    let gain_scale = if spec.gain_scale > 0.05 {
+        spec.gain_scale.clamp(0.25, 1.8)
+    } else {
+        1.0
+    };
+    let effective_dry = match spec.force_wet {
+        Some(wet) => !wet,
+        None => dry_before,
+    };
     let voice = spec.voice.trim().to_lowercase();
     let total_bars = total_bars.clamp(1, 32);
 
@@ -107,7 +117,7 @@ pub fn synthesize_audio_wav_bars(
                 let t = i as f32 / SAMPLE_RATE as f32;
                 let beat_pos = (t / beat_sec).fract();
                 // Dry/before = bass clashes straight through kick; After = clean sidechain/ducked pocket
-                let env = if dry_before {
+                let env = if effective_dry {
                     0.85
                 } else {
                     (beat_pos * 4.5).clamp(0.0, 1.0).powf(1.6) * (1.0 - beat_pos * 0.25)
@@ -138,7 +148,7 @@ pub fn synthesize_audio_wav_bars(
                     }
                 }
             }
-            if !dry_before {
+            if !effective_dry {
                 // Dotted-8th (3 sixteenth notes) feedback delay
                 let delay_samples = ((bar_sec / 16.0 * 3.0) * SAMPLE_RATE as f32) as usize;
                 let feedback = 0.52f32;
@@ -264,7 +274,7 @@ pub fn synthesize_audio_wav_bars(
     wav.extend_from_slice(&data_bytes.to_le_bytes());
 
     for s in samples {
-        let shaped = (s * 0.92).tanh();
+        let shaped = (s * 0.85 * gain_scale).tanh();
         let pcm = (shaped * i16::MAX as f32) as i16;
         wav.extend_from_slice(&pcm.to_le_bytes());
     }
@@ -318,6 +328,9 @@ mod tests {
                 include_drums: true,
                 before_label: Some("Bars 1-7 (Beat 3 accent)".into()),
                 after_label: Some("Bar 8 (Beat 4 accent)".into()),
+                gain_scale: 1.0,
+                pitch_shift_semis: 0.0,
+                force_wet: None,
             };
 
             let path = std::env::temp_dir().join(format!("learn-audio-{voice}-{}.wav", Uuid::new_v4()));

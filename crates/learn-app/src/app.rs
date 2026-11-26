@@ -69,6 +69,8 @@ pub struct LearnApp {
     audio_child: Option<Child>,
     audio_status: Option<String>,
     audio_showing_after: bool,
+    audio_preview_spec: Option<AudioDemoSpec>,
+    audio_preview_tag: Option<String>,
     audio_looping: bool,
     audio_wav_path: Option<PathBuf>,
     audio_started_at: Option<Instant>,
@@ -149,6 +151,8 @@ impl LearnApp {
             audio_child: None,
             audio_status: None,
             audio_showing_after: false,
+            audio_preview_spec: None,
+            audio_preview_tag: None,
             audio_looping: true,
             audio_wav_path: None,
             audio_started_at: None,
@@ -465,11 +469,33 @@ impl LearnApp {
     }
 
     fn pick_choice(&mut self, choice_id: &str, cx: &mut Context<Self>) {
-        if self.last_answer.is_some() || self.busy_message.is_some() {
+        if self.busy_message.is_some() {
             return;
         }
-        self.selected_choice_id = Some(choice_id.to_string());
-        self.error_banner = None;
+        // Before answering, highlight the picked option; after answering, still allow auditioning any choice!
+        if self.last_answer.is_none() {
+            self.selected_choice_id = Some(choice_id.to_string());
+            self.error_banner = None;
+        }
+
+        // If this question has an Audio example, immediately play back what this choice sounds like!
+        if let Some(q) = self.current_question.clone() {
+            if let Some(ExampleMedia::Audio { spec, .. }) = &q.media {
+                if let Some(choice) = q.choices.iter().find(|c| c.id == choice_id) {
+                    if let Some(effect) = &choice.audio_effect {
+                        let audition_spec = spec.with_choice_effect(effect);
+                        let label = format!("Choice [{}]", choice.id);
+                        self.play_audio_override(audition_spec, label, cx);
+                        return;
+                    } else if self.last_answer.is_some() && choice.id == q.correct_choice_id {
+                        let label = format!("Choice [{}] (Correct)", choice.id);
+                        self.play_audio_demo(spec.clone(), false, label, cx);
+                        return;
+                    }
+                }
+            }
+        }
+
         cx.notify();
     }
 
@@ -514,6 +540,8 @@ impl LearnApp {
         }
         self.audio_status = None;
         self.audio_showing_after = false;
+        self.audio_preview_spec = None;
+        self.audio_preview_tag = None;
         self.audio_started_at = None;
         self.audio_active_step = None;
         self.audio_wav_path = None;
@@ -631,6 +659,10 @@ impl LearnApp {
         .detach();
     }
 
+    fn play_audio_override(&mut self, spec: AudioDemoSpec, label: String, cx: &mut Context<Self>) {
+        self.play_audio_internal(spec.clone(), false, Some(spec), Some(label.clone()), label, cx);
+    }
+
     fn play_audio_demo(
         &mut self,
         spec: AudioDemoSpec,
@@ -638,10 +670,27 @@ impl LearnApp {
         label: String,
         cx: &mut Context<Self>,
     ) {
+        self.play_audio_internal(spec, dry_before, None, None, label, cx);
+    }
+
+    fn play_audio_internal(
+        &mut self,
+        spec: AudioDemoSpec,
+        dry_before: bool,
+        preview_override: Option<AudioDemoSpec>,
+        preview_tag: Option<String>,
+        label: String,
+        cx: &mut Context<Self>,
+    ) {
         self.stop_audio_quiet();
-        let tag = if dry_before { "before" } else { "after" };
+        let tag = if preview_override.is_some() {
+            "choice"
+        } else if dry_before {
+            "original"
+        } else {
+            "target"
+        };
         let wav_path = std::env::temp_dir().join(format!("learn-demo-{tag}.wav"));
-        // Synthesize 16 sample-accurate seamless bars when looping, or 2 bars for one-shot playback
         let bars = if self.audio_looping { 16 } else { 2 };
         let active_levels = if !dry_before && !spec.after_step_levels.is_empty() {
             &spec.after_step_levels
@@ -659,7 +708,9 @@ impl LearnApp {
                 Ok(child) => {
                     self.audio_child = Some(child);
                     self.audio_wav_path = Some(path);
-                    self.audio_showing_after = !dry_before;
+                    self.audio_showing_after = !dry_before && preview_override.is_none();
+                    self.audio_preview_spec = preview_override;
+                    self.audio_preview_tag = preview_tag;
                     self.audio_bpm = spec.bpm.clamp(70.0, 170.0);
                     self.audio_steps_per_bar = steps_per_bar;
                     self.audio_started_at = Some(Instant::now());
@@ -2670,33 +2721,40 @@ impl LearnApp {
                 let before_lbl = spec
                     .before_label
                     .clone()
-                    .unwrap_or_else(|| "Starting Loop".into());
+                    .unwrap_or_else(|| "Hear Original".into());
                 let after_lbl = spec
                     .after_label
                     .clone()
-                    .unwrap_or_else(|| "Target Result".into());
-                let b_status = before_lbl.clone();
+                    .unwrap_or_else(|| "Hear Target Result".into());
+                let b_status = format!("Original ({before_lbl})");
                 let a_status = after_lbl.clone();
-                // Show Target Result button after answering so before-answer audio is crystal-clear & non-confusing
                 let show_after_btn = self.last_answer.is_some();
 
-                let fallback_levels: Vec<f32> = if spec.step_levels.is_empty() {
+                let active_spec = self.audio_preview_spec.as_ref().unwrap_or(spec);
+                let fallback_levels: Vec<f32> = if active_spec.step_levels.is_empty() {
                     vec![0.85, 0.35, 0.55, 0.45, 0.85, 0.35, 0.55, 0.45]
                 } else {
                     Vec::new()
                 };
-                let displayed_levels: &[f32] =
-                    if self.audio_showing_after && !spec.after_step_levels.is_empty() {
-                        &spec.after_step_levels
-                    } else if !spec.step_levels.is_empty() {
-                        &spec.step_levels
+                let displayed_levels: &[f32] = if let Some(preview) = &self.audio_preview_spec {
+                    if !preview.step_levels.is_empty() {
+                        &preview.step_levels
                     } else {
                         &fallback_levels
-                    };
-                let view_tag = if self.audio_showing_after && !spec.after_step_levels.is_empty() {
+                    }
+                } else if self.audio_showing_after && !spec.after_step_levels.is_empty() {
+                    &spec.after_step_levels
+                } else if !spec.step_levels.is_empty() {
+                    &spec.step_levels
+                } else {
+                    &fallback_levels
+                };
+                let view_tag = if let Some(tag) = &self.audio_preview_tag {
+                    format!("AUDITIONING: {tag}")
+                } else if self.audio_showing_after && !spec.after_step_levels.is_empty() {
                     format!("SHOWING: {after_lbl}")
                 } else {
-                    format!("SHOWING: {before_lbl}")
+                    format!("SHOWING: Original ({before_lbl})")
                 };
 
                 let mut card = div()
@@ -2893,7 +2951,7 @@ impl LearnApp {
                                         cx,
                                     );
                                 }))
-                                .child(format!("▶ {before_lbl}")),
+                                .child(format!("▶ Original ({before_lbl})")),
                         )
                         .when(show_after_btn, |el| {
                             el.child(
@@ -3474,6 +3532,8 @@ impl LearnApp {
             };
 
             let answered = self.last_answer.is_some();
+            let has_audio = matches!(q.media, Some(ExampleMedia::Audio { .. }));
+            let has_choice_audio = has_audio && (choice.audio_effect.is_some() || (answered && choice.id == q.correct_choice_id));
             choices_col = choices_col.child(
                 div()
                     .id(("choice", idx))
@@ -3484,7 +3544,7 @@ impl LearnApp {
                     .bg(bg)
                     .border_1()
                     .border_color(border)
-                    .when(!answered, |el| {
+                    .when(!answered || has_choice_audio, |el| {
                         el.cursor_pointer()
                             .hover(|s| s.bg(theme::bg_card_hover()).border_color(theme::accent()))
                     })

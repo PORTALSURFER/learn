@@ -743,6 +743,7 @@ mod tests {
             trap_kind: Some(DistractorTrapKind::ConfusesConcept),
             trap_target: Some("fn-mut".into()),
             why_wrong: Some("That describes FnMut, not FnOnce.".into()),
+            audio_effect: None,
         };
         let trap_hyp = QuestionChoice {
             id: "C".into(),
@@ -750,6 +751,7 @@ mod tests {
             trap_kind: Some(DistractorTrapKind::Misconception),
             trap_target: Some("closures_spawn_threads".into()),
             why_wrong: Some("Closures run synchronously unless explicitly spawned.".into()),
+            audio_effect: None,
         };
 
         // 1. Wrong pick triggers inhibitory Confuses edge

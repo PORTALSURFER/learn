@@ -9,8 +9,9 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::models::{
-    AudioDemoSpec, ConceptInput, DetectedRunner, DistractorTrapKind, ExampleMedia, FlowStep,
-    MediaReveal, QuestionChoice, QuestionIntent, RunnerKind, SchedulerDirective, SkillLevel,
+    AudioDemoSpec, ChoiceAudioEffect, ConceptInput, DetectedRunner, DistractorTrapKind,
+    ExampleMedia, FlowStep, MediaReveal, QuestionChoice, QuestionIntent, RunnerKind,
+    SchedulerDirective, SkillLevel,
 };
 
 #[derive(Debug, Clone)]
@@ -171,11 +172,29 @@ pub fn media_object_schema() -> Value {
     })
 }
 
+pub fn choice_audio_effect_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["stepLevels", "cutoffStartHz", "cutoffEndHz", "accentStep", "nudgeMs", "gainScale", "pitchShiftSemis", "wetEffect"],
+        "properties": {
+            "stepLevels": { "type": "array", "items": { "type": "number" } },
+            "cutoffStartHz": { "type": "number" },
+            "cutoffEndHz": { "type": "number" },
+            "accentStep": { "type": "integer" },
+            "nudgeMs": { "type": "number" },
+            "gainScale": { "type": "number" },
+            "pitchShiftSemis": { "type": "number" },
+            "wetEffect": { "type": "string", "enum": ["default", "dry", "wet"] }
+        }
+    })
+}
+
 pub fn question_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["goal", "primer", "hint", "media", "prompt", "correctAnswer", "distractors", "explanation", "angleSummary"],
+        "required": ["goal", "primer", "hint", "media", "prompt", "correctAnswer", "correctAudioEffect", "distractors", "explanation", "angleSummary"],
         "properties": {
             "goal": { "type": "string" },
             "primer": { "type": "string" },
@@ -183,6 +202,7 @@ pub fn question_schema() -> Value {
             "media": media_object_schema(),
             "prompt": { "type": "string" },
             "correctAnswer": { "type": "string" },
+            "correctAudioEffect": choice_audio_effect_schema(),
             "distractors": {
                 "type": "array",
                 "minItems": 3,
@@ -190,7 +210,7 @@ pub fn question_schema() -> Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["text", "trapKind", "trapTarget", "whyWrong"],
+                    "required": ["text", "trapKind", "trapTarget", "whyWrong", "audioEffect"],
                     "properties": {
                         "text": { "type": "string" },
                         "trapKind": {
@@ -198,7 +218,8 @@ pub fn question_schema() -> Value {
                             "enum": ["confuses_concept", "misconception", "careless"]
                         },
                         "trapTarget": { "type": "string" },
-                        "whyWrong": { "type": "string" }
+                        "whyWrong": { "type": "string" },
+                        "audioEffect": choice_audio_effect_schema()
                     }
                 }
             },
@@ -292,8 +313,31 @@ enum RawDistractor {
         trap_target: Option<String>,
         #[serde(rename = "whyWrong", default)]
         why_wrong: Option<String>,
+        #[serde(rename = "audioEffect", default)]
+        audio_effect: Option<RawChoiceAudioEffect>,
     },
     Plain(String),
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RawChoiceAudioEffect {
+    #[serde(default)]
+    step_levels: Vec<f32>,
+    #[serde(default)]
+    cutoff_start_hz: f32,
+    #[serde(default)]
+    cutoff_end_hz: f32,
+    #[serde(default)]
+    accent_step: i32,
+    #[serde(default)]
+    nudge_ms: f32,
+    #[serde(default)]
+    gain_scale: f32,
+    #[serde(default)]
+    pitch_shift_semis: f32,
+    #[serde(default)]
+    wet_effect: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -360,6 +404,8 @@ struct RawQuestion {
     media: Option<RawMedia>,
     prompt: String,
     correct_answer: String,
+    #[serde(default)]
+    correct_audio_effect: Option<RawChoiceAudioEffect>,
     distractors: Vec<RawDistractor>,
     explanation: String,
     #[serde(default)]
@@ -425,6 +471,41 @@ fn parse_trap_kind(raw: Option<&str>) -> Option<DistractorTrapKind> {
     }
 }
 
+fn convert_raw_choice_audio(raw: Option<RawChoiceAudioEffect>) -> Option<ChoiceAudioEffect> {
+    let r = raw?;
+    let wet_effect = match r.wet_effect.trim().to_lowercase().as_str() {
+        "wet" => Some(true),
+        "dry" => Some(false),
+        _ => None,
+    };
+    let accent_step = if (1..=16).contains(&r.accent_step) {
+        Some(r.accent_step as u8)
+    } else {
+        None
+    };
+    let has_any = !r.step_levels.is_empty()
+        || r.cutoff_start_hz > 60.0
+        || r.cutoff_end_hz > 60.0
+        || accent_step.is_some()
+        || r.nudge_ms.abs() > 0.1
+        || (r.gain_scale > 0.05 && (r.gain_scale - 1.0).abs() > 0.05)
+        || r.pitch_shift_semis.abs() > 0.05
+        || wet_effect.is_some();
+    if !has_any {
+        return None;
+    }
+    Some(ChoiceAudioEffect {
+        step_levels: r.step_levels.into_iter().take(16).map(|v| v.clamp(0.0, 1.0)).collect(),
+        cutoff_start_hz: r.cutoff_start_hz,
+        cutoff_end_hz: r.cutoff_end_hz,
+        accent_step,
+        nudge_ms: r.nudge_ms,
+        gain_scale: r.gain_scale,
+        pitch_shift_semis: r.pitch_shift_semis,
+        wet_effect,
+    })
+}
+
 pub fn parse_and_shuffle_question(val: Value) -> Result<GeneratedQuestion> {
     let raw: RawQuestion = serde_json::from_value(val).context("invalid question JSON")?;
     let prompt = raw.prompt.trim().to_string();
@@ -434,18 +515,27 @@ pub fn parse_and_shuffle_question(val: Value) -> Result<GeneratedQuestion> {
         return Err(anyhow!("Question JSON missing prompt, correctAnswer, or explanation."));
     }
 
+    let correct_audio = convert_raw_choice_audio(raw.correct_audio_effect);
+
     let mut seen = HashSet::new();
     seen.insert(correct.to_lowercase());
-    let mut distractors: Vec<(String, Option<DistractorTrapKind>, Option<String>, Option<String>)> = Vec::new();
+    let mut distractors: Vec<(
+        String,
+        Option<DistractorTrapKind>,
+        Option<String>,
+        Option<String>,
+        Option<ChoiceAudioEffect>,
+    )> = Vec::new();
 
     for d in raw.distractors {
-        let (text, kind, target, why_wrong) = match d {
-            RawDistractor::Plain(s) => (s, None, None, None),
+        let (text, kind, target, why_wrong, audio_effect) = match d {
+            RawDistractor::Plain(s) => (s, None, None, None, None),
             RawDistractor::Tagged {
                 text,
                 trap_kind,
                 trap_target,
                 why_wrong,
+                audio_effect,
             } => (
                 text,
                 parse_trap_kind(trap_kind.as_deref()),
@@ -455,22 +545,51 @@ pub fn parse_and_shuffle_question(val: Value) -> Result<GeneratedQuestion> {
                 why_wrong
                     .map(|w| w.trim().chars().take(260).collect::<String>())
                     .filter(|w| !w.is_empty()),
+                convert_raw_choice_audio(audio_effect),
             ),
         };
         let t = text.trim().to_string();
         if !t.is_empty() && seen.insert(t.to_lowercase()) {
-            distractors.push((t, kind, target, why_wrong));
+            distractors.push((t, kind, target, why_wrong, audio_effect));
         }
     }
     if distractors.len() < 3 {
         return Err(anyhow!("Question JSON must provide 3 distinct distractors."));
     }
 
-    let mut pool: Vec<(String, bool, Option<DistractorTrapKind>, Option<String>, Option<String>)> = vec![
-        (correct, true, None, None, None),
-        (distractors[0].0.clone(), false, distractors[0].1, distractors[0].2.clone(), distractors[0].3.clone()),
-        (distractors[1].0.clone(), false, distractors[1].1, distractors[1].2.clone(), distractors[1].3.clone()),
-        (distractors[2].0.clone(), false, distractors[2].1, distractors[2].2.clone(), distractors[2].3.clone()),
+    let mut pool: Vec<(
+        String,
+        bool,
+        Option<DistractorTrapKind>,
+        Option<String>,
+        Option<String>,
+        Option<ChoiceAudioEffect>,
+    )> = vec![
+        (correct, true, None, None, None, correct_audio),
+        (
+            distractors[0].0.clone(),
+            false,
+            distractors[0].1,
+            distractors[0].2.clone(),
+            distractors[0].3.clone(),
+            distractors[0].4.clone(),
+        ),
+        (
+            distractors[1].0.clone(),
+            false,
+            distractors[1].1,
+            distractors[1].2.clone(),
+            distractors[1].3.clone(),
+            distractors[1].4.clone(),
+        ),
+        (
+            distractors[2].0.clone(),
+            false,
+            distractors[2].1,
+            distractors[2].2.clone(),
+            distractors[2].3.clone(),
+            distractors[2].4.clone(),
+        ),
     ];
     let mut rng = rand::thread_rng();
     pool.shuffle(&mut rng);
@@ -478,7 +597,9 @@ pub fn parse_and_shuffle_question(val: Value) -> Result<GeneratedQuestion> {
     let labels = ["A", "B", "C", "D"];
     let mut correct_choice_id = "A".to_string();
     let mut choices = Vec::with_capacity(4);
-    for (idx, (text, is_right, trap_kind, trap_target, why_wrong)) in pool.into_iter().enumerate() {
+    for (idx, (text, is_right, trap_kind, trap_target, why_wrong, audio_effect)) in
+        pool.into_iter().enumerate()
+    {
         let id = labels[idx].to_string();
         if is_right {
             correct_choice_id = id.clone();
@@ -489,6 +610,7 @@ pub fn parse_and_shuffle_question(val: Value) -> Result<GeneratedQuestion> {
             trap_kind,
             trap_target,
             why_wrong,
+            audio_effect,
         });
     }
 
@@ -568,6 +690,9 @@ fn convert_raw_media(m: RawMedia) -> Option<ExampleMedia> {
                 include_drums: m.include_drums,
                 before_label: if m.before_label.trim().is_empty() { None } else { Some(m.before_label.trim().to_string()) },
                 after_label: if m.after_label.trim().is_empty() { None } else { Some(m.after_label.trim().to_string()) },
+                gain_scale: 1.0,
+                pitch_shift_semis: 0.0,
+                force_wet: None,
             },
         }),
         "interactive_html" if m.html.trim().len() >= 20 => Some(ExampleMedia::InteractiveHtml {
@@ -732,7 +857,7 @@ pub fn build_question_prompt(directive: &SchedulerDirective) -> String {
     lines.push("- CHOICES: Keep each of the 4 choices SHORT (<= 14 words), concrete, and parallel in structure, varying ONE clear dimension at a time. Exactly 1 unambiguously right answer and 3 clearly distinct distractors (never 'All of the above').".into());
     lines.push("- `hint`: 1 crisp sentence nudging the learner toward the mental model WITHOUT revealing the correct choice.".into());
     lines.push("- `media`: ACTIVELY include a concrete supporting example (`reveal: \"before_answer\"` by default!) so the learner can SEE, HEAR, or FEEL the starting setup before answering—without spoiling which option A-D is correct:".into());
-    lines.push("  * `audio`: STRONGLY PREFERRED for music, sound design, rhythm, groove, or acoustics! Choose `voice` ('rim_click', 'kick_bass', 'delay', or 'synth'). Put the STARTING sound in `values` (4-16 floats with strong visual contrast, e.g. accent >= 0.90 vs regular <= 0.35) + `labels`, and put the TARGET/CORRECT sound in `afterValues`. `beforeLabel` must describe the starting loop (e.g. 'Starting Loop'), and `afterLabel` must describe the target result (e.g. 'Target Sound') — NEVER put a wrong distractor in `afterValues`!".into());
+    lines.push("  * `audio`: STRONGLY PREFERRED for music, sound design, rhythm, groove, or acoustics! Choose `voice` ('rim_click', 'kick_bass', 'delay', or 'synth'). Put the ORIGINAL starting sound in `values` (4-16 floats with strong visual contrast, e.g. accent >= 0.90 vs regular <= 0.35) + `labels`, and put the TARGET/CORRECT sound in `afterValues`. ALSO populate `correctAudioEffect` AND every distractor's `audioEffect` (`stepLevels`, `cutoffStartHz`/`cutoffEndHz`, `accentStep`, `nudgeMs`, `gainScale`, `pitchShiftSemis`, `wetEffect`: 'default'|'dry'|'wet') so selecting ANY answer A-D plays back what THAT specific edit would actually sound like! For non-audio questions, leave `audioEffect` fields empty/0/'default'.".into());
     lines.push("  * `curve`: 4-16 normalized values (0.0..1.0 with clear visual contrast) + concise labels — ideal for filter/energy curves, step velocity grids, math functions, growth curves, or envelopes.".into());
     lines.push("  * `flow`: 2-5 connected `flowSteps` (`label`, `note`) — ideal for signal chains, protocols, lifecycles, causal steps, or pipelines.".into());
     lines.push("  * `contrast`: side-by-side comparison (`leftTitle`/`leftPoints` vs `rightTitle`/`rightPoints`) — ideal for clarifying two competing forces.".into());
