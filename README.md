@@ -1,30 +1,26 @@
-# Learn · Native Rust + GPUI Adaptive Learning App
+# Learn · Native Rust + GPUI Cognitive Mesh Learning App
 
-A local-first desktop app built in **Rust + GPUI** that trains you on **any topic** through live AI-generated 4-choice questions, spaced repetition, and a compressed persistent **Knowledge Map** stored in SQLite.
+A local-first desktop app built in **Rust + GPUI** that trains you on **any topic** through live AI-generated 4-choice questions, a neuro-symbolic **Cognitive Mesh** stored in SQLite, and a bounded background question buffer.
 
-## How It Works
+## Architecture
 
-1. **Local User Profiles**: Sign up or sign in locally (`~/.learn-iocore/learn.db`). All learned concepts, misconceptions, mastery scores, and streaks persist across restarts.
-2. **Compressed Knowledge Map (`learn-core::store`)**: Instead of hoarding massive raw Q&A logs, each topic is modeled as compact concept nodes (`depth 1–4`, `mastery`, SM-2 `ease_factor` & `interval_hours`, max 3 concise `misconceptions`, max 4 `recent_angles`), and answered questions automatically prune to a rolling window of 10 per topic.
-3. **Deterministic Learning Scheduler (`learn-core::scheduler`)**: Prioritizes:
-   - `review_mistake`: Re-tests missed concepts from a fresh angle to resolve tracked misconceptions.
-   - `reinforce`: Spaced-repetition checks on mastered concepts.
-   - `introduce`: Interleaves unseen concepts from fundamentals upward.
-   - `dig_deeper`: Automatically deepens and expands the Knowledge Map once fundamentals reach high confidence.
-4. **Local Subscription CLI & API Runners (`learn-core::runner`)**:
-   - **Codex CLI** (`codex exec --ephemeral --skip-git-repo-check -s read-only --output-schema ...`)
-   - **Antigravity CLI** (`agy -p ...`)
-   - **Gemini CLI** (`gemini -p ...`)
-   - **Claude CLI** (`claude -p ... --output-format text`)
-   - **Direct Gemini API / OpenAI API** (via `GEMINI_API_KEY` / `OPENAI_API_KEY` or saved in Settings)
-   - **Instant Offline Demo** fallback for immediate testing
-5. **Background Prefetching**: While you read explanations after answering, the next tailored question is prefetched off the UI thread so clicking **Next Question** (`Enter`) feels instant.
+- **`crates/learn-core`** (zero UI dependencies, `< 1s` boundary tests, ready to reuse for a future `learn.iocore.dev` online/sync backend):
+  - **Cognitive Mesh (`mesh.rs`)**: Tracks `(μ mastery, σ uncertainty, S stability)` per concept, signed typed edges (`Requires` +w, `Bridges` +w, `Confuses` -w), predictive-coding **tension seams**, and **Shadow Misconception Nodes** with Bayesian-lite posterior updates and automatic pruning.
+  - **Zero-extra-LLM local belief propagation**: Distractors are pre-tagged at generation time with `trapKind`, `trapTarget`, and `whyWrong`, so clicking an answer runs 1-hop damped credit/doubt backpropagation, associative stability refresh, confusion-edge weighting, and shadow-node updates in `< 1ms`.
+  - **~200-Token Cognitive Slice**: Compiles `macro_map`, `frontier`, `tension_seams`, `active_hypotheses`, `confusion_pairs`, and `strong_bridges` (cross-topic mastered analogies) for every live AI prompt.
+  - **Clarifying Question Gap Capture**: Ask any question mid-quiz (e.g., *"What is a motif?"*) to get a spoiler-free explanation tied to your topic and automatically add the missing prerequisite concept to your Cognitive Mesh for upcoming practice.
+  - **Bounded Adaptive Buffer (`DEFAULT_BUFFER_TARGET = 3`)**: Keeps up to 3 ready questions queued ahead on distinct scheduled concepts, invalidates stale queued questions for concepts you just answered, and refills off the UI thread for zero-wait transitions.
+  - **Local Subscription CLI & API Runners (`runner.rs`)**: Auto-detects `codex` (`codex exec --ephemeral --skip-git-repo-check -s read-only --output-schema`), `agy`, `gemini`, `claude`, plus optional direct Gemini/OpenAI API keys and an instant offline Demo mode.
+- **`crates/learn-app`** (native macOS GPUI desktop UI):
+  - Local user profiles persisted in `~/.learn-iocore/learn.db` (SQLite WAL mode).
+  - Live Quiz Arena with plain-English **Goal & Context**, keyboard shortcuts (`1`–`4` / `A`–`D`, `Enter` / `Space`), tailored **"Why your pick didn't fit"** feedback, Cognitive Mesh update notes, and the bottom **Ask Tutor** clarifying-question bar.
+  - Visual **Cognitive Mesh Map** displaying Depth 1–4 concept tiers, `μ ± σ` & stability `S`, High-Tension Seams, Active Shadow Misconception Hypotheses, Inhibitory Confusion Links, and Cross-Topic Analogy Bridges.
 
 ## Quick Start
 
 ```bash
-# Run the fast (< 1s) boundary unit tests for learn-core
-cargo test -p learn-core
+# Run all boundary unit tests (< 1s)
+cargo test --workspace
 
 # Launch the native GPUI desktop app
 cargo run -p learn-app
@@ -34,8 +30,4 @@ cargo run -p learn-app
 
 - **Quiz Arena**: `1`–`4` (or `A`–`D`) to pick an answer, `Enter` or `Space` for next question.
 - **Forms**: `Tab` switches Auth fields, `Cmd+V` pastes into focused inputs, `Enter` submits.
-- **App**: `Cmd+Q` quits cleanly.
-
-## Extending to `learn.iocore.dev` Later
-
-All persistence, scheduling, and AI runner logic lives cleanly inside `crates/learn-core` with zero UI dependencies—making it straightforward to add a cloud sync endpoint or hosted web/MCP backend for `learn.iocore.dev` on top of the exact same crate.
+- **Window**: `Cmd+W` / red traffic light or `Cmd+Q` quits cleanly.

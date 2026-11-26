@@ -116,9 +116,9 @@ impl QuestionIntent {
 
     pub fn label(&self) -> &'static str {
         match self {
-            QuestionIntent::ReviewMistake => "Mistake Retry",
-            QuestionIntent::Reinforce => "Spaced Review",
-            QuestionIntent::Introduce => "New Concept",
+            QuestionIntent::ReviewMistake => "Mistake / Contrast",
+            QuestionIntent::Reinforce => "Spaced / Seam Check",
+            QuestionIntent::Introduce => "Frontier Probe",
             QuestionIntent::DigDeeper => "Deep Dive",
         }
     }
@@ -175,6 +175,76 @@ impl ConceptStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeKind {
+    /// Excitatory prerequisite (+w): mastering B propagates credit back to A; failing A raises tension on B.
+    Requires,
+    /// Excitatory analogy/transfer (+w): bridges a mastered anchor (possibly from another topic) to a target concept.
+    Bridges,
+    /// Inhibitory confusion synapse (-w): learner mixes up A and B; prompts contrast questions.
+    Confuses,
+}
+
+impl EdgeKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EdgeKind::Requires => "requires",
+            EdgeKind::Bridges => "bridges",
+            EdgeKind::Confuses => "confuses",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "bridges" => EdgeKind::Bridges,
+            "confuses" => EdgeKind::Confuses,
+            _ => EdgeKind::Requires,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConceptEdge {
+    pub id: String,
+    pub topic_id: String,
+    /// Concept slug (or external topic::concept label for cross-topic Bridges)
+    pub from_slug: String,
+    pub from_label: String,
+    pub to_slug: String,
+    pub to_label: String,
+    pub kind: EdgeKind,
+    /// Positive magnitude in [0.0, 1.0]; semantics are signed by `kind` (Confuses = inhibitory).
+    pub weight: f64,
+    /// Predictive-coding tension in [0.0, 1.0] computed on Requires edges.
+    pub tension: f64,
+    pub note: String,
+}
+
+/// Shadow Node representing a latent misconception / mental model hypothesis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MisconceptionNode {
+    pub id: String,
+    pub topic_id: String,
+    pub slug: String,
+    pub label: String,
+    /// Posterior probability in [0.0, 1.0]. Pruned when < 0.15 or refuted twice.
+    pub probability: f64,
+    pub evidence_count: u32,
+    pub refute_count: u32,
+    /// Concept slugs this shadow node explains errors on.
+    pub linked_concepts: Vec<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistractorTrapKind {
+    ConfusesConcept,
+    Misconception,
+    Careless,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: String,
@@ -210,9 +280,12 @@ pub struct ConceptInput {
     pub subtopic: String,
     pub summary: String,
     pub depth: u8,
+    /// Prerequisite concept titles/slugs (`Requires` edges seeded into the mesh).
+    #[serde(default)]
+    pub requires: Vec<String>,
 }
 
-/// Compressed per-concept mastery record persisted in SQLite.
+/// Compressed per-concept node carrying the Cognitive Mesh `(μ, σ, S)` state tuple.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConceptNode {
     pub id: String,
@@ -222,7 +295,12 @@ pub struct ConceptNode {
     pub subtopic: String,
     pub summary: String,
     pub depth: u8,
+    /// μ — estimated mastery in [0.0, 1.0]. Unseen starts at 0.50 with high σ=0.90.
     pub mastery: f64,
+    /// σ — epistemic uncertainty in [0.08, 1.0]. Shrinks as observations accumulate.
+    pub uncertainty: f64,
+    /// S — memory stability in hours (grows with successful spaced & associative recall).
+    pub stability: f64,
     pub ease_factor: f64,
     pub interval_hours: f64,
     pub attempts: u32,
@@ -242,6 +320,14 @@ pub struct ConceptNode {
 pub struct QuestionChoice {
     pub id: String, // "A" | "B" | "C" | "D"
     pub text: String,
+    /// Pre-tagged distractor trap metadata so local mesh propagation needs zero extra LLM calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trap_kind: Option<DistractorTrapKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trap_target: Option<String>,
+    /// Specific reason why choosing this distractor fails or creates the wrong effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why_wrong: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +339,9 @@ pub struct StoredQuestion {
     pub subtopic: String,
     pub depth: u8,
     pub intent: QuestionIntent,
+    /// Plain-English framing of the goal/purpose before the question prompt.
+    #[serde(default)]
+    pub goal: String,
     pub prompt: String,
     pub choices: Vec<QuestionChoice>,
     pub correct_choice_id: String,
@@ -272,12 +361,72 @@ pub struct AnswerResult {
     pub selected_choice_id: String,
     pub correct_choice_id: String,
     pub correct_choice_text: String,
+    /// Tailored reason why the user's specific wrong choice falls short (when wrong).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_why_wrong: Option<String>,
     pub explanation: String,
     pub reward_message: String,
     pub concept: ConceptNode,
     pub topic_streak: u32,
     pub best_streak: u32,
     pub mastery_delta: f64,
+    /// Human-readable summary of Cognitive Mesh propagation effects (backprop, confusion, shadow nodes).
+    #[serde(default)]
+    pub mesh_effects: Vec<String>,
+}
+
+/// Cross-topic mastered concept anchor for analogy bridges.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrossTopicAnchor {
+    pub topic_title: String,
+    pub concept_slug: String,
+    pub concept_title: String,
+    pub mastery: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontierEntry {
+    pub node: String,
+    pub mu: f64,
+    pub sigma: f64,
+    pub why: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TensionSeam {
+    pub edge: String,
+    pub tension: f64,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HypothesisBrief {
+    pub misconception: String,
+    pub prob: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfusionPairBrief {
+    pub pair: String,
+    pub weight: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeBrief {
+    pub from: String,
+    pub to: String,
+    pub from_mu: f64,
+}
+
+/// Compact ~150-250 token multi-resolution Cognitive Slice serialized for the AI.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CognitiveSlice {
+    pub macro_map: Vec<String>,
+    pub frontier: Vec<FrontierEntry>,
+    pub tension_seams: Vec<TensionSeam>,
+    pub active_hypotheses: Vec<HypothesisBrief>,
+    pub confusion_pairs: Vec<ConfusionPairBrief>,
+    pub strong_bridges: Vec<BridgeBrief>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,6 +442,15 @@ pub struct CompressedContext {
     pub mastered_concepts: Vec<String>,
     pub struggling_concepts: Vec<StrugglingSummary>,
     pub recent_angles: Vec<String>,
+    /// Multi-resolution Cognitive Mesh slice (~200 tokens)
+    #[serde(default)]
+    pub cognitive_slice: CognitiveSlice,
+    /// Optional concept slug to contrast against when targeting an inhibitory `Confuses` edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contrast_concept: Option<String>,
+    /// Optional misconception hypothesis to directly confirm/refute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_hypothesis: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,5 +476,16 @@ pub struct KnowledgeStats {
 pub struct KnowledgeMap {
     pub topic: TopicSummary,
     pub concepts: Vec<ConceptNode>,
+    pub edges: Vec<ConceptEdge>,
+    pub misconceptions: Vec<MisconceptionNode>,
+    pub cognitive_slice: CognitiveSlice,
     pub stats: KnowledgeStats,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClarifyingReply {
+    pub question_asked: String,
+    pub answer: String,
+    pub added_concept_title: Option<String>,
+    pub mesh_note: Option<String>,
 }

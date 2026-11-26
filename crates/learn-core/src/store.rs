@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,9 +7,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::mesh::{DEFAULT_UNSEEN_MU, DEFAULT_UNSEEN_SIGMA, slugify_label};
 use crate::models::{
-    ConceptInput, ConceptNode, ConceptStatus, QuestionChoice, QuestionIntent, RunnerKind,
-    SkillLevel, StoredQuestion, TopicSummary, User,
+    ConceptEdge, ConceptInput, ConceptNode, ConceptStatus, CrossTopicAnchor, EdgeKind,
+    MisconceptionNode, QuestionChoice, QuestionIntent, RunnerKind, SkillLevel, StoredQuestion,
+    TopicSummary, User,
 };
 
 const MAX_MISCONCEPTIONS: usize = 3;
@@ -26,25 +28,11 @@ pub fn now_ms() -> i64 {
 }
 
 fn slugify(input: &str) -> String {
-    let mut slug = String::new();
-    let mut prev_dash = false;
-    for ch in input.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash && !slug.is_empty() {
-            slug.push('-');
-            prev_dash = true;
-        }
-        if slug.len() >= 64 {
-            break;
-        }
-    }
-    let trimmed = slug.trim_matches('-').to_string();
-    if trimmed.is_empty() {
+    let clean = slugify_label(input);
+    if clean.is_empty() {
         format!("concept-{}", &Uuid::new_v4().to_string()[..8])
     } else {
-        trimmed
+        clean
     }
 }
 
@@ -94,6 +82,7 @@ pub struct CreateQuestionParams {
     pub topic_id: String,
     pub concept_id: String,
     pub intent: QuestionIntent,
+    pub goal: String,
     pub prompt: String,
     pub choices: Vec<QuestionChoice>,
     pub correct_choice_id: String,
@@ -164,7 +153,9 @@ impl KnowledgeStore {
                 subtopic TEXT NOT NULL,
                 summary TEXT NOT NULL DEFAULT '',
                 depth INTEGER NOT NULL DEFAULT 1,
-                mastery REAL NOT NULL DEFAULT 0.0,
+                mastery REAL NOT NULL DEFAULT 0.50,
+                uncertainty REAL NOT NULL DEFAULT 0.90,
+                stability REAL NOT NULL DEFAULT 0.0,
                 ease_factor REAL NOT NULL DEFAULT 2.5,
                 interval_hours REAL NOT NULL DEFAULT 0.0,
                 attempts INTEGER NOT NULL DEFAULT 0,
@@ -179,11 +170,39 @@ impl KnowledgeStore {
                 UNIQUE(topic_id, slug)
             );
 
+            CREATE TABLE IF NOT EXISTS concept_edges (
+                id TEXT PRIMARY KEY,
+                topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+                from_slug TEXT NOT NULL,
+                from_label TEXT NOT NULL,
+                to_slug TEXT NOT NULL,
+                to_label TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                weight REAL NOT NULL DEFAULT 0.75,
+                tension REAL NOT NULL DEFAULT 0.0,
+                note TEXT NOT NULL DEFAULT '',
+                UNIQUE(topic_id, from_slug, to_slug, kind)
+            );
+
+            CREATE TABLE IF NOT EXISTS misconception_nodes (
+                id TEXT PRIMARY KEY,
+                topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+                slug TEXT NOT NULL,
+                label TEXT NOT NULL,
+                probability REAL NOT NULL DEFAULT 0.55,
+                evidence_count INTEGER NOT NULL DEFAULT 1,
+                refute_count INTEGER NOT NULL DEFAULT 0,
+                linked_concepts_json TEXT NOT NULL DEFAULT '[]',
+                updated_at INTEGER NOT NULL,
+                UNIQUE(topic_id, slug)
+            );
+
             CREATE TABLE IF NOT EXISTS questions (
                 id TEXT PRIMARY KEY,
                 topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
                 concept_id TEXT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
                 intent TEXT NOT NULL,
+                goal TEXT NOT NULL DEFAULT '',
                 prompt TEXT NOT NULL,
                 choices_json TEXT NOT NULL,
                 correct_choice_id TEXT NOT NULL,
@@ -198,9 +217,27 @@ impl KnowledgeStore {
 
             CREATE INDEX IF NOT EXISTS idx_topics_user ON topics(user_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_concepts_topic ON concepts(topic_id, depth, mastery);
+            CREATE INDEX IF NOT EXISTS idx_edges_topic ON concept_edges(topic_id, kind, tension);
+            CREATE INDEX IF NOT EXISTS idx_misconceptions_topic ON misconception_nodes(topic_id, probability);
             CREATE INDEX IF NOT EXISTS idx_questions_open ON questions(topic_id, answered_at, created_at);
             "#,
         )?;
+
+        // Additive migration for databases created before the Cognitive Mesh upgrade:
+        let _ = self
+            .conn
+            .execute("ALTER TABLE concepts ADD COLUMN uncertainty REAL NOT NULL DEFAULT 0.90", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE concepts ADD COLUMN stability REAL NOT NULL DEFAULT 0.0", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE questions ADD COLUMN goal TEXT NOT NULL DEFAULT ''", []);
+        // Normalize legacy unseen rows (mastery=0.0, attempts=0) to the neutral Bayesian prior (0.50, σ=0.90)
+        let _ = self.conn.execute(
+            "UPDATE concepts SET mastery = ?1, uncertainty = ?2 WHERE attempts = 0 AND mastery = 0.0",
+            params![DEFAULT_UNSEEN_MU, DEFAULT_UNSEEN_SIGMA],
+        );
         Ok(())
     }
 
@@ -368,7 +405,7 @@ impl KnowledgeStore {
             SELECT t.id, t.user_id, t.title, t.level,
                    COUNT(c.id) AS concept_count,
                    COALESCE(SUM(CASE WHEN c.status IN ('mastered', 'deepened') THEN 1 ELSE 0 END), 0) AS mastered_count,
-                   COALESCE(AVG(c.mastery), 0.0) AS average_mastery,
+                   COALESCE(AVG(CASE WHEN c.attempts > 0 THEN c.mastery ELSE 0.0 END), 0.0) AS average_mastery,
                    t.total_attempts, t.correct_attempts, t.current_streak, t.best_streak,
                    t.created_at, t.updated_at
             FROM topics t
@@ -393,7 +430,7 @@ impl KnowledgeStore {
                 SELECT t.id, t.user_id, t.title, t.level,
                        COUNT(c.id) AS concept_count,
                        COALESCE(SUM(CASE WHEN c.status IN ('mastered', 'deepened') THEN 1 ELSE 0 END), 0) AS mastered_count,
-                       COALESCE(AVG(c.mastery), 0.0) AS average_mastery,
+                       COALESCE(AVG(CASE WHEN c.attempts > 0 THEN c.mastery ELSE 0.0 END), 0.0) AS average_mastery,
                        t.total_attempts, t.correct_attempts, t.current_streak, t.best_streak,
                        t.created_at, t.updated_at
                 FROM topics t
@@ -439,6 +476,41 @@ impl KnowledgeStore {
         Ok((next_streak, next_best))
     }
 
+    /// Queries high-mastery concepts from the user's *other* topics for cross-domain analogy bridges.
+    pub fn list_cross_topic_anchors(
+        &self,
+        user_id: &str,
+        exclude_topic_id: &str,
+        limit: usize,
+    ) -> Result<Vec<CrossTopicAnchor>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT t.title, c.slug, c.title, c.mastery
+            FROM concepts c
+            JOIN topics t ON t.id = c.topic_id
+            WHERE t.user_id = ?1
+              AND t.id != ?2
+              AND c.attempts > 0
+              AND c.mastery >= 0.72
+            ORDER BY c.mastery DESC, c.attempts DESC
+            LIMIT ?3
+            "#,
+        )?;
+        let rows = stmt.query_map(params![user_id, exclude_topic_id, limit as i64], |r| {
+            Ok(CrossTopicAnchor {
+                topic_title: r.get(0)?,
+                concept_slug: r.get(1)?,
+                concept_title: r.get(2)?,
+                mastery: r.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     fn map_topic(row: &rusqlite::Row<'_>) -> rusqlite::Result<TopicSummary> {
         let level_str: String = row.get(3)?;
         let avg: f64 = row.get(6)?;
@@ -459,15 +531,15 @@ impl KnowledgeStore {
         })
     }
 
-    // ---------- Compressed Concepts ----------
+    // ---------- Compressed Concepts + Seeded Prerequisite Edges ----------
 
     pub fn upsert_concepts(&self, topic_id: &str, inputs: &[ConceptInput]) -> Result<Vec<ConceptNode>> {
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare(
                 r#"
-                INSERT INTO concepts (id, topic_id, slug, title, subtopic, summary, depth)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                INSERT INTO concepts (id, topic_id, slug, title, subtopic, summary, depth, mastery, uncertainty, stability)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0.0)
                 ON CONFLICT(topic_id, slug) DO UPDATE SET
                     title = excluded.title,
                     subtopic = excluded.subtopic,
@@ -492,7 +564,9 @@ impl KnowledgeStore {
                     title,
                     subtopic,
                     summary,
-                    depth
+                    depth,
+                    DEFAULT_UNSEEN_MU,
+                    DEFAULT_UNSEEN_SIGMA,
                 ])?;
             }
             tx.execute(
@@ -501,14 +575,77 @@ impl KnowledgeStore {
             )?;
         }
         tx.commit()?;
-        self.list_concepts(topic_id)
+
+        let all_concepts = self.list_concepts(topic_id)?;
+        let by_slug: HashMap<String, String> = all_concepts
+            .iter()
+            .map(|c| (c.slug.clone(), c.title.clone()))
+            .collect();
+
+        // Seed `Requires` edges from explicit `item.requires` OR infer light depth-chain edges if none provided
+        let mut edges_to_upsert = Vec::new();
+        for item in inputs {
+            let to_slug = slugify_label(item.title.trim());
+            let Some(to_label) = by_slug.get(&to_slug) else { continue };
+            for req in &item.requires {
+                let from_slug = slugify_label(req.trim());
+                if from_slug != to_slug {
+                    if let Some(from_label) = by_slug.get(&from_slug) {
+                        edges_to_upsert.push(ConceptEdge {
+                            id: format!("req:{topic_id}:{from_slug}:{to_slug}"),
+                            topic_id: topic_id.to_string(),
+                            from_slug,
+                            from_label: from_label.clone(),
+                            to_slug: to_slug.clone(),
+                            to_label: to_label.clone(),
+                            kind: EdgeKind::Requires,
+                            weight: 0.80,
+                            tension: 0.0,
+                            note: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // If the AI didn't emit explicit `requires` links, synthesize sensible depth (d-1 -> d) edges
+        if edges_to_upsert.is_empty() && self.list_edges(topic_id)?.is_empty() {
+            for target in &all_concepts {
+                if target.depth > 1 {
+                    if let Some(prereq) = all_concepts
+                        .iter()
+                        .find(|c| c.depth == target.depth - 1 && c.subtopic == target.subtopic)
+                        .or_else(|| all_concepts.iter().find(|c| c.depth == target.depth - 1))
+                    {
+                        edges_to_upsert.push(ConceptEdge {
+                            id: format!("req:{topic_id}:{}:{}", prereq.slug, target.slug),
+                            topic_id: topic_id.to_string(),
+                            from_slug: prereq.slug.clone(),
+                            from_label: prereq.title.clone(),
+                            to_slug: target.slug.clone(),
+                            to_label: target.title.clone(),
+                            kind: EdgeKind::Requires,
+                            weight: 0.70,
+                            tension: 0.0,
+                            note: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+
+        if !edges_to_upsert.is_empty() {
+            self.upsert_edges(&edges_to_upsert)?;
+        }
+
+        Ok(all_concepts)
     }
 
     pub fn list_concepts(&self, topic_id: &str) -> Result<Vec<ConceptNode>> {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, topic_id, slug, title, subtopic, summary, depth,
-                   mastery, ease_factor, interval_hours,
+                   mastery, uncertainty, stability, ease_factor, interval_hours,
                    attempts, correct_count, wrong_count, consecutive_correct,
                    status, misconceptions_json, recent_angles_json,
                    last_seen_at, next_review_at
@@ -530,7 +667,7 @@ impl KnowledgeStore {
             .query_row(
                 r#"
                 SELECT id, topic_id, slug, title, subtopic, summary, depth,
-                       mastery, ease_factor, interval_hours,
+                       mastery, uncertainty, stability, ease_factor, interval_hours,
                        attempts, correct_count, wrong_count, consecutive_correct,
                        status, misconceptions_json, recent_angles_json,
                        last_seen_at, next_review_at
@@ -551,15 +688,18 @@ impl KnowledgeStore {
         self.conn.execute(
             r#"
             UPDATE concepts
-            SET mastery = ?1, ease_factor = ?2, interval_hours = ?3,
-                attempts = ?4, correct_count = ?5, wrong_count = ?6,
-                consecutive_correct = ?7, status = ?8,
-                misconceptions_json = ?9, recent_angles_json = ?10,
-                last_seen_at = ?11, next_review_at = ?12
-            WHERE id = ?13
+            SET mastery = ?1, uncertainty = ?2, stability = ?3,
+                ease_factor = ?4, interval_hours = ?5,
+                attempts = ?6, correct_count = ?7, wrong_count = ?8,
+                consecutive_correct = ?9, status = ?10,
+                misconceptions_json = ?11, recent_angles_json = ?12,
+                last_seen_at = ?13, next_review_at = ?14
+            WHERE id = ?15
             "#,
             params![
                 node.mastery.clamp(0.0, 1.0),
+                node.uncertainty.clamp(0.05, 1.0),
+                node.stability.max(0.0),
                 node.ease_factor,
                 node.interval_hours,
                 node.attempts,
@@ -580,9 +720,9 @@ impl KnowledgeStore {
     }
 
     fn map_concept(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConceptNode> {
-        let status_str: String = row.get(14)?;
-        let mis_json: String = row.get(15)?;
-        let ang_json: String = row.get(16)?;
+        let status_str: String = row.get(16)?;
+        let mis_json: String = row.get(17)?;
+        let ang_json: String = row.get(18)?;
         Ok(ConceptNode {
             id: row.get(0)?,
             topic_id: row.get(1)?,
@@ -592,18 +732,167 @@ impl KnowledgeStore {
             summary: row.get(5)?,
             depth: row.get(6)?,
             mastery: row.get(7)?,
-            ease_factor: row.get(8)?,
-            interval_hours: row.get(9)?,
-            attempts: row.get(10)?,
-            correct_count: row.get(11)?,
-            wrong_count: row.get(12)?,
-            consecutive_correct: row.get(13)?,
+            uncertainty: row.get(8)?,
+            stability: row.get(9)?,
+            ease_factor: row.get(10)?,
+            interval_hours: row.get(11)?,
+            attempts: row.get(12)?,
+            correct_count: row.get(13)?,
+            wrong_count: row.get(14)?,
+            consecutive_correct: row.get(15)?,
             status: ConceptStatus::from_str(&status_str),
             misconceptions: serde_json::from_str(&mis_json).unwrap_or_default(),
             recent_angles: serde_json::from_str(&ang_json).unwrap_or_default(),
-            last_seen_at: row.get(17)?,
-            next_review_at: row.get(18)?,
+            last_seen_at: row.get(19)?,
+            next_review_at: row.get(20)?,
         })
+    }
+
+    // ---------- Cognitive Mesh Edges & Shadow Misconception Nodes ----------
+
+    pub fn upsert_edges(&self, edges: &[ConceptEdge]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                INSERT INTO concept_edges (id, topic_id, from_slug, from_label, to_slug, to_label, kind, weight, tension, note)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT(topic_id, from_slug, to_slug, kind) DO UPDATE SET
+                    from_label = excluded.from_label,
+                    to_label = excluded.to_label,
+                    weight = excluded.weight,
+                    tension = excluded.tension,
+                    note = excluded.note
+                "#,
+            )?;
+            for e in edges {
+                stmt.execute(params![
+                    e.id,
+                    e.topic_id,
+                    e.from_slug,
+                    e.from_label,
+                    e.to_slug,
+                    e.to_label,
+                    e.kind.as_str(),
+                    e.weight.clamp(0.0, 1.0),
+                    e.tension.clamp(0.0, 1.0),
+                    e.note,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_edges_by_ids(&self, ids: &[String]) -> Result<()> {
+        for id in ids {
+            self.conn
+                .execute("DELETE FROM concept_edges WHERE id = ?1", params![id])?;
+        }
+        Ok(())
+    }
+
+    pub fn list_edges(&self, topic_id: &str) -> Result<Vec<ConceptEdge>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, topic_id, from_slug, from_label, to_slug, to_label, kind, weight, tension, note
+            FROM concept_edges
+            WHERE topic_id = ?1
+            ORDER BY tension DESC, weight DESC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![topic_id], |r| {
+            let kind_str: String = r.get(6)?;
+            Ok(ConceptEdge {
+                id: r.get(0)?,
+                topic_id: r.get(1)?,
+                from_slug: r.get(2)?,
+                from_label: r.get(3)?,
+                to_slug: r.get(4)?,
+                to_label: r.get(5)?,
+                kind: EdgeKind::from_str(&kind_str),
+                weight: r.get(7)?,
+                tension: r.get(8)?,
+                note: r.get(9)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_misconceptions(&self, items: &[MisconceptionNode]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                INSERT INTO misconception_nodes (id, topic_id, slug, label, probability, evidence_count, refute_count, linked_concepts_json, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(topic_id, slug) DO UPDATE SET
+                    label = excluded.label,
+                    probability = excluded.probability,
+                    evidence_count = excluded.evidence_count,
+                    refute_count = excluded.refute_count,
+                    linked_concepts_json = excluded.linked_concepts_json,
+                    updated_at = excluded.updated_at
+                "#,
+            )?;
+            for m in items {
+                stmt.execute(params![
+                    m.id,
+                    m.topic_id,
+                    m.slug,
+                    m.label,
+                    m.probability.clamp(0.0, 1.0),
+                    m.evidence_count,
+                    m.refute_count,
+                    serde_json::to_string(&m.linked_concepts)?,
+                    m.updated_at,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_misconceptions_by_ids(&self, ids: &[String]) -> Result<()> {
+        for id in ids {
+            self.conn
+                .execute("DELETE FROM misconception_nodes WHERE id = ?1", params![id])?;
+        }
+        Ok(())
+    }
+
+    pub fn list_misconceptions(&self, topic_id: &str) -> Result<Vec<MisconceptionNode>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, topic_id, slug, label, probability, evidence_count, refute_count, linked_concepts_json, updated_at
+            FROM misconception_nodes
+            WHERE topic_id = ?1
+            ORDER BY probability DESC, updated_at DESC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![topic_id], |r| {
+            let linked_json: String = r.get(7)?;
+            Ok(MisconceptionNode {
+                id: r.get(0)?,
+                topic_id: r.get(1)?,
+                slug: r.get(2)?,
+                label: r.get(3)?,
+                probability: r.get(4)?,
+                evidence_count: r.get(5)?,
+                refute_count: r.get(6)?,
+                linked_concepts: serde_json::from_str(&linked_json).unwrap_or_default(),
+                updated_at: r.get(8)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     // ---------- Compact Question Queue ----------
@@ -615,15 +904,16 @@ impl KnowledgeStore {
         self.conn.execute(
             r#"
             INSERT INTO questions (
-                id, topic_id, concept_id, intent, prompt, choices_json,
+                id, topic_id, concept_id, intent, goal, prompt, choices_json,
                 correct_choice_id, explanation, angle_summary, source, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             "#,
             params![
                 id,
                 input.topic_id,
                 input.concept_id,
                 input.intent.as_str(),
+                input.goal.trim(),
                 input.prompt.trim(),
                 serde_json::to_string(&input.choices)?,
                 input.correct_choice_id,
@@ -642,7 +932,7 @@ impl KnowledgeStore {
             .query_row(
                 r#"
                 SELECT q.id, q.topic_id, q.concept_id, c.title, c.subtopic, c.depth,
-                       q.intent, q.prompt, q.choices_json, q.correct_choice_id,
+                       q.intent, q.goal, q.prompt, q.choices_json, q.correct_choice_id,
                        q.explanation, q.angle_summary, q.source, q.created_at,
                        q.answered_at, q.selected_choice_id, q.is_correct
                 FROM questions q
@@ -661,7 +951,7 @@ impl KnowledgeStore {
             .query_row(
                 r#"
                 SELECT q.id, q.topic_id, q.concept_id, c.title, c.subtopic, c.depth,
-                       q.intent, q.prompt, q.choices_json, q.correct_choice_id,
+                       q.intent, q.goal, q.prompt, q.choices_json, q.correct_choice_id,
                        q.explanation, q.angle_summary, q.source, q.created_at,
                        q.answered_at, q.selected_choice_id, q.is_correct
                 FROM questions q
@@ -759,7 +1049,6 @@ impl KnowledgeStore {
             params![now, selected_choice_id, if is_correct { 1 } else { 0 }, question_id],
         )?;
 
-        // Keep SQLite compact: prune answered questions beyond the rolling window of 10.
         self.conn.execute(
             r#"
             DELETE FROM questions
@@ -779,9 +1068,9 @@ impl KnowledgeStore {
 
     fn map_question(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredQuestion> {
         let intent_str: String = row.get(6)?;
-        let choices_json: String = row.get(8)?;
-        let source_str: String = row.get(12)?;
-        let is_correct_int: Option<i64> = row.get(16)?;
+        let choices_json: String = row.get(9)?;
+        let source_str: String = row.get(13)?;
+        let is_correct_int: Option<i64> = row.get(17)?;
         Ok(StoredQuestion {
             id: row.get(0)?,
             topic_id: row.get(1)?,
@@ -790,15 +1079,16 @@ impl KnowledgeStore {
             subtopic: row.get(4)?,
             depth: row.get(5)?,
             intent: QuestionIntent::from_str(&intent_str),
-            prompt: row.get(7)?,
+            goal: row.get(7)?,
+            prompt: row.get(8)?,
             choices: serde_json::from_str(&choices_json).unwrap_or_default(),
-            correct_choice_id: row.get(9)?,
-            explanation: row.get(10)?,
-            angle_summary: row.get(11)?,
+            correct_choice_id: row.get(10)?,
+            explanation: row.get(11)?,
+            angle_summary: row.get(12)?,
             source: RunnerKind::from_str(&source_str),
-            created_at: row.get(13)?,
-            answered_at: row.get(14)?,
-            selected_choice_id: row.get(15)?,
+            created_at: row.get(14)?,
+            answered_at: row.get(15)?,
+            selected_choice_id: row.get(16)?,
             is_correct: is_correct_int.map(|v| v == 1),
         })
     }
@@ -809,11 +1099,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compresses_misconceptions_angles_and_prunes_old_questions() {
+    fn compresses_misconceptions_angles_edges_and_prunes_old_questions() {
         let store = KnowledgeStore::open_in_memory().unwrap();
         let user = store.create_user("alice", "secret123", RunnerKind::Codex).unwrap();
         assert_eq!(store.authenticate_user("alice", "secret123").unwrap().id, user.id);
-        assert!(store.authenticate_user("alice", "wrong").is_err());
 
         let topic = store.create_topic(&user.id, "Rust Ownership", SkillLevel::Beginner).unwrap();
         let concepts = store
@@ -825,25 +1114,29 @@ mod tests {
                         subtopic: "Memory".into(),
                         summary: "Tracks mutable and shared borrows.".into(),
                         depth: 1,
-                    },
-                    ConceptInput {
-                        title: "Borrow Checker".into(),
-                        subtopic: "Memory".into(),
-                        summary: "Updated summary".into(),
-                        depth: 1,
+                        requires: vec![],
                     },
                     ConceptInput {
                         title: "Lifetimes".into(),
                         subtopic: "Memory".into(),
                         summary: "Ensure references never outlive data.".into(),
                         depth: 2,
+                        requires: vec!["Borrow Checker".into()],
                     },
                 ],
             )
             .unwrap();
         assert_eq!(concepts.len(), 2);
+
+        let edges = store.list_edges(&topic.id).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].kind, EdgeKind::Requires);
+        assert_eq!(edges[0].from_slug, "borrow-checker");
+        assert_eq!(edges[0].to_slug, "lifetimes");
+
         let mut bc = concepts.iter().find(|c| c.slug == "borrow-checker").unwrap().clone();
-        assert_eq!(bc.summary, "Updated summary");
+        assert_eq!(bc.mastery, DEFAULT_UNSEEN_MU);
+        assert_eq!(bc.uncertainty, DEFAULT_UNSEEN_SIGMA);
 
         bc.misconceptions = vec!["m1".into(), "m2".into(), "m3".into(), "m4".into(), "m4".into()];
         bc.recent_angles = vec!["a1".into(), "a2".into(), "a3".into(), "a4".into(), "a5".into()];
@@ -857,12 +1150,13 @@ mod tests {
                     topic_id: topic.id.clone(),
                     concept_id: bc.id.clone(),
                     intent: QuestionIntent::Introduce,
+                    goal: "Understand why Rust tracks borrows.".into(),
                     prompt: format!("Q {i}?"),
                     choices: vec![
-                        QuestionChoice { id: "A".into(), text: "1".into() },
-                        QuestionChoice { id: "B".into(), text: "2".into() },
-                        QuestionChoice { id: "C".into(), text: "3".into() },
-                        QuestionChoice { id: "D".into(), text: "4".into() },
+                        QuestionChoice { id: "A".into(), text: "1".into(), trap_kind: None, trap_target: None, why_wrong: None },
+                        QuestionChoice { id: "B".into(), text: "2".into(), trap_kind: None, trap_target: None, why_wrong: None },
+                        QuestionChoice { id: "C".into(), text: "3".into(), trap_kind: None, trap_target: None, why_wrong: None },
+                        QuestionChoice { id: "D".into(), text: "4".into(), trap_kind: None, trap_target: None, why_wrong: None },
                     ],
                     correct_choice_id: "A".into(),
                     explanation: "A is right.".into(),

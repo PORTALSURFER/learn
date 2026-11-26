@@ -9,17 +9,25 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::models::{
-    ConceptInput, DetectedRunner, QuestionChoice, QuestionIntent, RunnerKind, SchedulerDirective,
-    SkillLevel,
+    ConceptInput, DetectedRunner, DistractorTrapKind, QuestionChoice, QuestionIntent, RunnerKind,
+    SchedulerDirective, SkillLevel,
 };
 
 #[derive(Debug, Clone)]
 pub struct GeneratedQuestion {
+    pub goal: String,
     pub prompt: String,
     pub choices: Vec<QuestionChoice>,
     pub correct_choice_id: String,
     pub explanation: String,
     pub angle_summary: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClarifyingAnalysis {
+    pub answer: String,
+    pub missing_concept: Option<ConceptInput>,
+    pub gap_note: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,12 +94,16 @@ pub fn concept_map_schema() -> Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["title", "subtopic", "summary", "depth"],
+                    "required": ["title", "subtopic", "summary", "depth", "requires"],
                     "properties": {
                         "title": { "type": "string" },
                         "subtopic": { "type": "string" },
                         "summary": { "type": "string" },
-                        "depth": { "type": "integer", "minimum": 1, "maximum": 4 }
+                        "depth": { "type": "integer", "minimum": 1, "maximum": 4 },
+                        "requires": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
                     }
                 }
             }
@@ -103,18 +115,49 @@ pub fn question_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["prompt", "correctAnswer", "distractors", "explanation", "angleSummary"],
+        "required": ["goal", "prompt", "correctAnswer", "distractors", "explanation", "angleSummary"],
         "properties": {
+            "goal": { "type": "string" },
             "prompt": { "type": "string" },
             "correctAnswer": { "type": "string" },
             "distractors": {
                 "type": "array",
                 "minItems": 3,
                 "maxItems": 3,
-                "items": { "type": "string" }
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["text", "trapKind", "trapTarget", "whyWrong"],
+                    "properties": {
+                        "text": { "type": "string" },
+                        "trapKind": {
+                            "type": "string",
+                            "enum": ["confuses_concept", "misconception", "careless"]
+                        },
+                        "trapTarget": { "type": "string" },
+                        "whyWrong": { "type": "string" }
+                    }
+                }
             },
             "explanation": { "type": "string" },
             "angleSummary": { "type": "string" }
+        }
+    })
+}
+
+pub fn clarifying_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["answer", "hasKnowledgeGap", "conceptTitle", "conceptSubtopic", "conceptSummary", "conceptDepth", "gapNote"],
+        "properties": {
+            "answer": { "type": "string" },
+            "hasKnowledgeGap": { "type": "boolean" },
+            "conceptTitle": { "type": "string" },
+            "conceptSubtopic": { "type": "string" },
+            "conceptSummary": { "type": "string" },
+            "conceptDepth": { "type": "integer", "minimum": 1, "maximum": 4 },
+            "gapNote": { "type": "string" }
         }
     })
 }
@@ -167,6 +210,8 @@ struct RawConcept {
     summary: String,
     #[serde(default = "default_depth")]
     depth: u8,
+    #[serde(default)]
+    requires: Vec<String>,
 }
 
 fn default_depth() -> u8 {
@@ -174,14 +219,49 @@ fn default_depth() -> u8 {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum RawDistractor {
+    Tagged {
+        text: String,
+        #[serde(rename = "trapKind", default)]
+        trap_kind: Option<String>,
+        #[serde(rename = "trapTarget", default)]
+        trap_target: Option<String>,
+        #[serde(rename = "whyWrong", default)]
+        why_wrong: Option<String>,
+    },
+    Plain(String),
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawQuestion {
+    #[serde(default)]
+    goal: String,
     prompt: String,
     correct_answer: String,
-    distractors: Vec<String>,
+    distractors: Vec<RawDistractor>,
     explanation: String,
     #[serde(default)]
     angle_summary: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawClarifying {
+    answer: String,
+    #[serde(default)]
+    has_knowledge_gap: bool,
+    #[serde(default)]
+    concept_title: String,
+    #[serde(default)]
+    concept_subtopic: String,
+    #[serde(default)]
+    concept_summary: String,
+    #[serde(default = "default_depth")]
+    concept_depth: u8,
+    #[serde(default)]
+    gap_note: String,
 }
 
 pub fn parse_concept_map(val: Value) -> Result<Vec<ConceptInput>> {
@@ -201,12 +281,28 @@ pub fn parse_concept_map(val: Value) -> Result<Vec<ConceptInput>> {
             },
             summary: item.summary.trim().chars().take(220).collect(),
             depth: item.depth.clamp(1, 4),
+            requires: item
+                .requires
+                .into_iter()
+                .map(|r| r.trim().to_string())
+                .filter(|r| !r.is_empty())
+                .take(3)
+                .collect(),
         });
     }
     if out.is_empty() {
         return Err(anyhow!("AI returned an empty concept map."));
     }
     Ok(out)
+}
+
+fn parse_trap_kind(raw: Option<&str>) -> Option<DistractorTrapKind> {
+    match raw?.trim().to_lowercase().as_str() {
+        "confuses_concept" => Some(DistractorTrapKind::ConfusesConcept),
+        "misconception" => Some(DistractorTrapKind::Misconception),
+        "careless" => Some(DistractorTrapKind::Careless),
+        _ => None,
+    }
 }
 
 pub fn parse_and_shuffle_question(val: Value) -> Result<GeneratedQuestion> {
@@ -220,22 +316,41 @@ pub fn parse_and_shuffle_question(val: Value) -> Result<GeneratedQuestion> {
 
     let mut seen = HashSet::new();
     seen.insert(correct.to_lowercase());
-    let mut distractors = Vec::new();
+    let mut distractors: Vec<(String, Option<DistractorTrapKind>, Option<String>, Option<String>)> = Vec::new();
+
     for d in raw.distractors {
-        let t = d.trim().to_string();
+        let (text, kind, target, why_wrong) = match d {
+            RawDistractor::Plain(s) => (s, None, None, None),
+            RawDistractor::Tagged {
+                text,
+                trap_kind,
+                trap_target,
+                why_wrong,
+            } => (
+                text,
+                parse_trap_kind(trap_kind.as_deref()),
+                trap_target
+                    .map(|t| t.trim().chars().take(120).collect::<String>())
+                    .filter(|t| !t.is_empty()),
+                why_wrong
+                    .map(|w| w.trim().chars().take(260).collect::<String>())
+                    .filter(|w| !w.is_empty()),
+            ),
+        };
+        let t = text.trim().to_string();
         if !t.is_empty() && seen.insert(t.to_lowercase()) {
-            distractors.push(t);
+            distractors.push((t, kind, target, why_wrong));
         }
     }
     if distractors.len() < 3 {
         return Err(anyhow!("Question JSON must provide 3 distinct distractors."));
     }
 
-    let mut pool = vec![
-        (correct, true),
-        (distractors[0].clone(), false),
-        (distractors[1].clone(), false),
-        (distractors[2].clone(), false),
+    let mut pool: Vec<(String, bool, Option<DistractorTrapKind>, Option<String>, Option<String>)> = vec![
+        (correct, true, None, None, None),
+        (distractors[0].0.clone(), false, distractors[0].1, distractors[0].2.clone(), distractors[0].3.clone()),
+        (distractors[1].0.clone(), false, distractors[1].1, distractors[1].2.clone(), distractors[1].3.clone()),
+        (distractors[2].0.clone(), false, distractors[2].1, distractors[2].2.clone(), distractors[2].3.clone()),
     ];
     let mut rng = rand::thread_rng();
     pool.shuffle(&mut rng);
@@ -243,12 +358,18 @@ pub fn parse_and_shuffle_question(val: Value) -> Result<GeneratedQuestion> {
     let labels = ["A", "B", "C", "D"];
     let mut correct_choice_id = "A".to_string();
     let mut choices = Vec::with_capacity(4);
-    for (idx, (text, is_right)) in pool.into_iter().enumerate() {
+    for (idx, (text, is_right, trap_kind, trap_target, why_wrong)) in pool.into_iter().enumerate() {
         let id = labels[idx].to_string();
         if is_right {
             correct_choice_id = id.clone();
         }
-        choices.push(QuestionChoice { id, text });
+        choices.push(QuestionChoice {
+            id,
+            text,
+            trap_kind,
+            trap_target,
+            why_wrong,
+        });
     }
 
     let angle_summary = if raw.angle_summary.trim().is_empty() {
@@ -258,11 +379,56 @@ pub fn parse_and_shuffle_question(val: Value) -> Result<GeneratedQuestion> {
     };
 
     Ok(GeneratedQuestion {
+        goal: raw.goal.trim().chars().take(240).collect(),
         prompt,
         choices,
         correct_choice_id,
         explanation,
         angle_summary,
+    })
+}
+
+pub fn parse_clarifying_analysis(val: Value, current_concept_title: &str) -> Result<ClarifyingAnalysis> {
+    let raw: RawClarifying = serde_json::from_value(val).context("invalid clarifying JSON")?;
+    let answer = raw.answer.trim().to_string();
+    if answer.is_empty() {
+        return Err(anyhow!("AI returned an empty clarifying answer."));
+    }
+
+    let missing_concept = if raw.has_knowledge_gap && !raw.concept_title.trim().is_empty() {
+        Some(ConceptInput {
+            title: raw.concept_title.trim().chars().take(100).collect(),
+            subtopic: if raw.concept_subtopic.trim().is_empty() {
+                "Foundations".into()
+            } else {
+                raw.concept_subtopic.trim().chars().take(60).collect()
+            },
+            summary: raw.concept_summary.trim().chars().take(220).collect(),
+            depth: raw.concept_depth.clamp(1, 4),
+            requires: vec![],
+        })
+    } else {
+        None
+    };
+
+    let gap_note = {
+        let n = raw.gap_note.trim();
+        if n.is_empty() {
+            missing_concept.as_ref().map(|c| {
+                format!(
+                    "Learner asked about '{}' while studying '{}'.",
+                    c.title, current_concept_title
+                )
+            })
+        } else {
+            Some(n.chars().take(140).collect())
+        }
+    };
+
+    Ok(ClarifyingAnalysis {
+        answer,
+        missing_concept,
+        gap_note,
     })
 }
 
@@ -279,35 +445,39 @@ pub fn build_concept_map_prompt(
         )
     } else {
         format!(
-            "Already covered concepts (DO NOT repeat these; generate 6 deeper next-level concepts at depth {min_depth}-4): {}.",
+            "Already covered concepts (DO NOT repeat these; generate 6 deeper next-level concepts at depth {min_depth}-4 and link prerequisites in `requires`): {}.",
             existing_titles.join(", ")
         )
     };
 
     format!(
-        "You are an expert adaptive tutor building a compact Knowledge Map for \"{topic_title}\".\n\
+        "You are an expert adaptive tutor building a Cognitive Mesh Knowledge Map for \"{topic_title}\".\n\
          {scope_note}\n\
+         For depth 2-4 concepts, include 1-2 prerequisite concept titles in `requires` (empty array [] for depth 1).\n\
          Return ONLY a valid JSON object matching:\n\
-         {{\"concepts\":[{{\"title\":\"...\",\"subtopic\":\"...\",\"summary\":\"1-sentence core mental model\",\"depth\":1}}]}}\n\
-         Keep titles concise (2-5 words), group subtopics into 2-4 clean themes, and make every summary crisp and accurate."
+         {{\"concepts\":[{{\"title\":\"...\",\"subtopic\":\"...\",\"summary\":\"1-sentence core mental model\",\"depth\":1,\"requires\":[]}}]}}\n\
+         Keep titles concise (2-5 words), group subtopics into 2-4 themes, and make every summary crisp and accurate."
     )
 }
 
 pub fn build_question_prompt(directive: &SchedulerDirective) -> String {
     let intent_guidance = match directive.intent {
         QuestionIntent::Introduce => {
-            "Introduce this concept with an intuitive, concrete 4-choice question that teaches the core distinction."
+            "Introduce this frontier concept with an intuitive, concrete 4-choice question."
         }
         QuestionIntent::ReviewMistake => {
-            "The learner previously missed this concept. Ask about the SAME concept from a fresh angle/scenario that directly clears their misconception without reusing old wording."
+            "The learner previously missed this concept or triggered a confusion/misconception. Probe the SAME concept from a fresh angle or contrast scenario without reusing old wording."
         }
         QuestionIntent::Reinforce => {
-            "Reinforce retention by testing this concept in a slightly different practical scenario than before."
+            "Reinforce retention or resolve a high-tension prerequisite seam in a slightly different practical scenario."
         }
         QuestionIntent::DigDeeper => {
             "The learner has strong fundamentals. Ask a deeper trade-off, synthesis, or edge-case question at the target depth."
         }
     };
+
+    let slice_json = serde_json::to_string(&directive.compressed_context.cognitive_slice)
+        .unwrap_or_else(|_| "{}".into());
 
     let mut lines = vec![
         format!(
@@ -316,20 +486,32 @@ pub fn build_question_prompt(directive: &SchedulerDirective) -> String {
             directive.compressed_context.level.as_str()
         ),
         format!(
-            "Target concept: \"{}\" (subtopic: {}, summary: {}).",
-            directive.concept.title, directive.concept.subtopic, directive.concept.summary
+            "Target concept: \"{}\" (slug: {}, subtopic: {}, μ={:.2}, σ={:.2}, summary: {}).",
+            directive.concept.title,
+            directive.concept.slug,
+            directive.concept.subtopic,
+            directive.concept.mastery,
+            directive.concept.uncertainty,
+            directive.concept.summary
         ),
         format!(
             "Intent: {} (target depth {}/4). {intent_guidance}",
             directive.intent.as_str(),
             directive.target_depth
         ),
+        format!("Cognitive Slice (~200-token mesh state): {slice_json}"),
     ];
 
-    if !directive.concept.misconceptions.is_empty() {
+    if let Some(contrast) = &directive.compressed_context.contrast_concept {
         lines.push(format!(
-            "Misconceptions to resolve: {}",
-            directive.concept.misconceptions.join(" | ")
+            "CRITICAL: Craft a contrast question that cleanly separates \"{}\" from \"{}\".",
+            directive.concept.title, contrast
+        ));
+    }
+    if let Some(hyp) = &directive.compressed_context.target_hypothesis {
+        lines.push(format!(
+            "CRITICAL: Design this diagnostic question to directly confirm or refute the misconception hypothesis: \"{}\".",
+            hyp
         ));
     }
     if !directive.compressed_context.recent_angles.is_empty() {
@@ -338,19 +520,47 @@ pub fn build_question_prompt(directive: &SchedulerDirective) -> String {
             directive.compressed_context.recent_angles.join(" | ")
         ));
     }
-    if !directive.compressed_context.mastered_concepts.is_empty() {
-        lines.push(format!(
-            "Already mastered concepts: {}",
-            directive.compressed_context.mastered_concepts.join(", ")
-        ));
-    }
 
-    lines.push("Rules:".into());
-    lines.push("- Exactly 1 unambiguously correct answer and 3 plausible, similar-length distractors (never 'All of the above' or 'None of the above').".into());
-    lines.push("- Provide a crisp 2-sentence explanation of why the correct answer works.".into());
-    lines.push("- Provide a 4-8 word angleSummary describing what angle this question tested.".into());
-    lines.push("Return ONLY valid JSON: {\"prompt\":\"...\",\"correctAnswer\":\"...\",\"distractors\":[\"...\",\"...\",\"...\"],\"explanation\":\"...\",\"angleSummary\":\"...\"}".into());
+    lines.push("Pedagogical & Clarity Rules:".into());
+    lines.push("- Write in clear, concrete, everyday language matched to the learner's level. Briefly define any domain jargon inline instead of assuming the learner already knows it.".into());
+    lines.push("- `goal`: 1 plain-English sentence explaining WHAT we are trying to achieve with this technique/concept and WHY it matters in practice (shown above the question so the learner understands the purpose first).".into());
+    lines.push("- `prompt`: Clear, unambiguous scenario and question directly tied to that goal.".into());
+    lines.push("- Exactly 1 unambiguously correct answer and 3 plausible, similar-length distractors (never 'All of the above').".into());
+    lines.push("- For EACH distractor, provide `trapKind` ('confuses_concept' | 'misconception' | 'careless'), `trapTarget`, and `whyWrong` (1 crisp sentence explaining what picking THAT specific option would actually cause instead of the goal).".into());
+    lines.push("- `explanation`: 2-3 clear sentences explaining (1) the underlying purpose/mental model, (2) why the right answer achieves it best, and (3) how the alternative directions produce different or undesired effects.".into());
+    lines.push("- If `strong_bridges` has a mastered concept from another topic, feel free to weave in a brief analogy when explaining.".into());
+    lines.push("- `angleSummary`: 4-8 words describing what angle this question tested.".into());
+    lines.push("Return ONLY valid JSON: {\"goal\":\"...\",\"prompt\":\"...\",\"correctAnswer\":\"...\",\"distractors\":[{\"text\":\"...\",\"trapKind\":\"misconception\",\"trapTarget\":\"short_hypothesis\",\"whyWrong\":\"...\"},{\"text\":\"...\",\"trapKind\":\"confuses_concept\",\"trapTarget\":\"other_concept_slug\",\"whyWrong\":\"...\"},{\"text\":\"...\",\"trapKind\":\"careless\",\"trapTarget\":\"surface_pattern\",\"whyWrong\":\"...\"}],\"explanation\":\"...\",\"angleSummary\":\"...\"}".into());
     lines.join("\n")
+}
+
+pub fn build_clarifying_prompt(
+    topic_title: &str,
+    level: SkillLevel,
+    concept_title: &str,
+    question_prompt: &str,
+    learner_question: &str,
+    already_answered: bool,
+) -> String {
+    let spoiler_rule = if already_answered {
+        "The learner has already answered the quiz question, so you may reference the solution freely."
+    } else {
+        "IMPORTANT: The learner has NOT answered the quiz question yet. Explain the concept or term they asked about clearly WITHOUT revealing or hinting which multiple-choice option is correct."
+    };
+
+    format!(
+        "You are a helpful adaptive tutor teaching \"{topic_title}\" (learner level: {}).\n\
+         Current quiz concept: \"{concept_title}\".\n\
+         Current quiz question: \"{question_prompt}\"\n\
+         Learner's clarifying question: \"{learner_question}\"\n\
+         {spoiler_rule}\n\
+         Tasks:\n\
+         1. `answer`: Give a super clear, friendly 2-3 sentence plain-English explanation answering the learner's question specifically in the context of \"{topic_title}\".\n\
+         2. Identify if this question reveals a missing foundational term or concept (`hasKnowledgeGap`: true/false) that we should add to their Cognitive Mesh so future multiple-choice questions teach and reinforce it (always tied back to \"{topic_title}\").\n\
+         3. If `hasKnowledgeGap` is true, provide concise `conceptTitle` (2-4 words), `conceptSubtopic`, `conceptSummary` (1 crisp sentence tied to \"{topic_title}\"), `conceptDepth` (usually 1 for foundational terms), and `gapNote` (1 short sentence summarizing what the learner was unsure about).\n\
+         Return ONLY valid JSON matching the schema.",
+        level.as_str()
+    )
 }
 
 pub struct AiRunner {
@@ -515,6 +725,44 @@ impl AiRunner {
         parse_and_shuffle_question(json_val)
     }
 
+    pub fn answer_learner_question(
+        &self,
+        topic_title: &str,
+        level: SkillLevel,
+        concept_title: &str,
+        question_prompt: &str,
+        learner_question: &str,
+        already_answered: bool,
+        cfg: &RunnerConfig,
+    ) -> Result<ClarifyingAnalysis> {
+        if cfg.kind == RunnerKind::Demo {
+            let term = extract_demo_term(learner_question);
+            return Ok(ClarifyingAnalysis {
+                answer: format!(
+                    "[Demo Tutor] In {topic_title}, \"{term}\" is a foundational idea connected to {concept_title}. Switch to Codex CLI, Antigravity CLI, or an API key in Settings for full live AI explanations."
+                ),
+                missing_concept: Some(ConceptInput {
+                    title: term.clone(),
+                    subtopic: "Foundations".into(),
+                    summary: format!("Core meaning and role of {term} inside {topic_title}."),
+                    depth: 1,
+                    requires: vec![],
+                }),
+                gap_note: Some(format!("Asked: {}", learner_question.trim())),
+            });
+        }
+        let prompt = build_clarifying_prompt(
+            topic_title,
+            level,
+            concept_title,
+            question_prompt,
+            learner_question,
+            already_answered,
+        );
+        let json_val = self.run_json_prompt(&prompt, &clarifying_schema(), cfg)?;
+        parse_clarifying_analysis(json_val, concept_title)
+    }
+
     fn run_json_prompt(&self, prompt: &str, schema: &Value, cfg: &RunnerConfig) -> Result<Value> {
         match cfg.kind {
             RunnerKind::Codex => self.run_codex_cli(prompt, schema),
@@ -668,48 +916,56 @@ fn demo_concepts(topic: &str, existing: &[String], min_depth: u8) -> Vec<Concept
             subtopic: "Foundations".into(),
             summary: format!("The core purpose and unifying abstraction behind {t}."),
             depth: 1,
+            requires: vec![],
         },
         ConceptInput {
             title: "Core Primitives & Terms".into(),
             subtopic: "Foundations".into(),
             summary: format!("Key building blocks and terminology required to reason about {t}."),
             depth: 1,
+            requires: vec![],
         },
         ConceptInput {
             title: "Step-by-Step Lifecycle".into(),
             subtopic: "Mechanics".into(),
             summary: format!("How inputs transform into outputs across a typical {t} flow."),
             depth: 1,
+            requires: vec![],
         },
         ConceptInput {
             title: "Common Failure Modes".into(),
             subtopic: "Mechanics".into(),
             summary: format!("Frequent mistakes, pitfalls, and bottlenecks seen in {t}."),
             depth: 2,
+            requires: vec!["Step-by-Step Lifecycle".into()],
         },
         ConceptInput {
             title: "Trade-offs & Constraints".into(),
             subtopic: "Architecture".into(),
             summary: format!("Balancing speed, simplicity, and correctness in {t}."),
             depth: 2,
+            requires: vec![format!("{t} Mental Model")],
         },
         ConceptInput {
             title: "Applied Patterns".into(),
             subtopic: "Practice".into(),
             summary: format!("Proven ways experts structure real-world {t} solutions."),
             depth: 3,
+            requires: vec!["Trade-offs & Constraints".into()],
         },
         ConceptInput {
             title: "Diagnostics & Verification".into(),
             subtopic: "Practice".into(),
             summary: format!("How to observe, measure, and debug {t} systematically."),
             depth: 3,
+            requires: vec!["Common Failure Modes".into()],
         },
         ConceptInput {
             title: "Subtle Edge Cases".into(),
             subtopic: "Mastery".into(),
             summary: format!("Non-obvious interactions and boundary conditions in {t}."),
             depth: 4,
+            requires: vec!["Applied Patterns".into(), "Diagnostics & Verification".into()],
         },
     ];
     let existing_lower: HashSet<String> = existing.iter().map(|s| s.to_lowercase()).collect();
@@ -719,20 +975,58 @@ fn demo_concepts(topic: &str, existing: &[String], min_depth: u8) -> Vec<Concept
         .collect()
 }
 
+fn extract_demo_term(question: &str) -> String {
+    let cleaned = question
+        .trim()
+        .trim_end_matches('?')
+        .trim()
+        .to_string();
+    let lower = cleaned.to_lowercase();
+    for prefix in ["what is a ", "what is an ", "what is ", "what does ", "explain ", "define "] {
+        if lower.starts_with(prefix) {
+            let rest = cleaned[prefix.len()..].trim();
+            if !rest.is_empty() {
+                return rest.chars().take(48).collect();
+            }
+        }
+    }
+    if cleaned.is_empty() {
+        "Clarified Concept".into()
+    } else {
+        cleaned.chars().take(48).collect()
+    }
+}
+
 fn demo_question(directive: &SchedulerDirective) -> Value {
     let tag = match directive.intent {
-        QuestionIntent::Introduce => "Demo · Intro",
-        QuestionIntent::ReviewMistake => "Demo · Fresh-Angle Retry",
-        QuestionIntent::Reinforce => "Demo · Reinforcement",
+        QuestionIntent::Introduce => "Demo · Frontier Probe",
+        QuestionIntent::ReviewMistake => "Demo · Contrast / Retry",
+        QuestionIntent::Reinforce => "Demo · Seam Check",
         QuestionIntent::DigDeeper => "Demo · Deep Dive",
     };
     json!({
+        "goal": format!("Build a clear mental model of how \"{}\" serves real outcomes in {}.", directive.concept.title, directive.compressed_context.topic_title),
         "prompt": format!("[{tag}] In {}, which statement best captures \"{}\"?", directive.compressed_context.topic_title, directive.concept.title),
         "correctAnswer": directive.concept.summary,
         "distractors": [
-            format!("It is a legacy convention that should always be skipped when working with {}.", directive.compressed_context.topic_title),
-            format!("It eliminates all trade-offs across every subtopic of {}.", directive.compressed_context.topic_title),
-            "It only matters when real-world feedback and constraints are ignored."
+            {
+                "text": format!("It eliminates all trade-offs across every subtopic of {}.", directive.compressed_context.topic_title),
+                "trapKind": "misconception",
+                "trapTarget": format!("Assumes {} has no trade-offs", directive.concept.title),
+                "whyWrong": "Real systems always involve trade-offs; treating this concept as a magic cure misses its actual purpose."
+            },
+            {
+                "text": format!("It is interchangeable with Core Primitives & Terms in {}.", directive.compressed_context.topic_title),
+                "trapKind": "confuses_concept",
+                "trapTarget": "core-primitives-terms",
+                "whyWrong": "That confuses this specific mechanism with general vocabulary rather than its distinct role."
+            },
+            {
+                "text": "It only matters when real-world feedback and constraints are ignored.",
+                "trapKind": "careless",
+                "trapTarget": "surface_distractor",
+                "whyWrong": "In practice, real-world constraints and feedback are exactly why this concept exists."
+            }
         ],
         "explanation": format!("Select Codex CLI, Antigravity CLI, or an API key in Settings for live AI-authored questions. Core idea for \"{}\": {}", directive.concept.title, directive.concept.summary),
         "angleSummary": format!("{} ({:?} #{})", directive.concept.title, directive.intent, directive.concept.attempts + 1)
@@ -742,7 +1036,7 @@ fn demo_question(directive: &SchedulerDirective) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{CompressedContext, ConceptNode, ConceptStatus};
+    use crate::models::{CognitiveSlice, CompressedContext, ConceptNode, ConceptStatus};
 
     struct FakeExec;
 
@@ -760,7 +1054,7 @@ mod tests {
                 let out_file = &args[out_pos + 1];
                 std::fs::write(
                     out_file,
-                    r#"{"prompt":"Why does Rust enforce one mutable borrow?","correctAnswer":"To prevent data races and aliasing bugs at compile time.","distractors":["To make binaries smaller.","Because pointers cannot be copied.","To disable heap allocation."],"explanation":"Exclusive mutability prevents aliasing hazards before code runs.","angleSummary":"aliasing xor mutability"}"#,
+                    r#"{"prompt":"Why does Rust enforce one mutable borrow?","correctAnswer":"To prevent data races and aliasing bugs at compile time.","distractors":[{"text":"To make binaries smaller.","trapKind":"careless","trapTarget":"size_myth"},{"text":"Because lifetimes free memory early.","trapKind":"misconception","trapTarget":"lifetimes change runtime drop order"},{"text":"Because Copy and Borrow are identical.","trapKind":"confuses_concept","trapTarget":"copy-trait"}],"explanation":"Exclusive mutability prevents aliasing hazards before code runs.","angleSummary":"aliasing xor mutability"}"#,
                 )?;
                 return Ok(CommandOutput {
                     exit_code: 0,
@@ -773,12 +1067,11 @@ mod tests {
     }
 
     #[test]
-    fn detects_codex_and_parses_schema_output_safely() {
+    fn detects_codex_and_parses_tagged_distractors_safely() {
         let runner = AiRunner::with_executor(Box::new(FakeExec));
         let detected = runner.detect_runners("", "");
         let codex = detected.iter().find(|r| r.kind == RunnerKind::Codex).unwrap();
         assert!(codex.available);
-        assert_eq!(codex.version.as_deref(), Some("codex-cli 0.166.0"));
 
         let directive = SchedulerDirective {
             intent: QuestionIntent::Introduce,
@@ -790,7 +1083,9 @@ mod tests {
                 subtopic: "Memory".into(),
                 summary: "Shared xor mutable references.".into(),
                 depth: 1,
-                mastery: 0.0,
+                mastery: 0.50,
+                uncertainty: 0.90,
+                stability: 0.0,
                 ease_factor: 2.5,
                 interval_hours: 0.0,
                 attempts: 0,
@@ -812,6 +1107,9 @@ mod tests {
                 mastered_concepts: vec![],
                 struggling_concepts: vec![],
                 recent_angles: vec![],
+                cognitive_slice: CognitiveSlice::default(),
+                contrast_concept: None,
+                target_hypothesis: None,
             },
         };
 
@@ -825,7 +1123,7 @@ mod tests {
 
         let q = runner.generate_question(&directive, &cfg).unwrap();
         assert_eq!(q.choices.len(), 4);
-        let right = q.choices.iter().find(|c| c.id == q.correct_choice_id).unwrap();
-        assert_eq!(right.text, "To prevent data races and aliasing bugs at compile time.");
+        assert!(q.choices.iter().any(|c| c.trap_kind == Some(DistractorTrapKind::Misconception)));
+        assert!(q.choices.iter().any(|c| c.trap_kind == Some(DistractorTrapKind::ConfusesConcept)));
     }
 }

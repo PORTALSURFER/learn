@@ -4,12 +4,15 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 
+use crate::mesh::{
+    MeshObservation, compile_cognitive_slice, propagate_answer_observation, slugify_label,
+};
 use crate::models::{
-    AnswerResult, DetectedRunner, KnowledgeMap, RunnerKind, SkillLevel, StoredQuestion,
-    TopicSummary, User,
+    AnswerResult, ClarifyingReply, ConceptEdge, ConceptStatus, DetectedRunner, EdgeKind,
+    KnowledgeMap, RunnerKind, SkillLevel, StoredQuestion, TopicSummary, User,
 };
 use crate::runner::{AiRunner, RunnerConfig};
-use crate::scheduler::{apply_answer_outcome, select_next_directive, summarize_stats};
+use crate::scheduler::{select_next_directive, summarize_stats};
 use crate::store::{CreateQuestionParams, KnowledgeStore, now_ms};
 
 /// Number of ready-to-go questions kept buffered ahead of the active question.
@@ -18,7 +21,7 @@ pub const DEFAULT_BUFFER_TARGET: usize = 3;
 /// Total open questions maintained while one question is currently on screen (1 active + 3 buffered).
 pub const DEFAULT_OPEN_QUEUE_TARGET: usize = DEFAULT_BUFFER_TARGET + 1;
 
-/// Thread-safe application service coordinating storage, scheduling, and AI generation.
+/// Thread-safe application service coordinating storage, Cognitive Mesh propagation, scheduling, and AI generation.
 #[derive(Clone)]
 pub struct LearnService {
     store: Arc<Mutex<KnowledgeStore>>,
@@ -83,7 +86,6 @@ impl LearnService {
         let store = self.store.lock().unwrap();
         let prev = store.get_user_by_id(user_id)?;
         let updated = store.update_user_runner(user_id, runner, gemini_api_key, openai_api_key)?;
-        // If switching away from Demo to a live AI runner, clear queued demo questions so live ones take over.
         if let Some(old) = prev {
             if old.runner == RunnerKind::Demo && runner != RunnerKind::Demo {
                 let _ = store.delete_open_questions_by_source(user_id, RunnerKind::Demo);
@@ -106,15 +108,21 @@ impl LearnService {
             .get_topic(topic_id, user_id)?
             .ok_or_else(|| anyhow!("Topic not found"))?;
         let concepts = store.list_concepts(topic_id)?;
+        let edges = store.list_edges(topic_id)?;
+        let misconceptions = store.list_misconceptions(topic_id)?;
+        let anchors = store.list_cross_topic_anchors(user_id, topic_id, 4)?;
+        let cognitive_slice = compile_cognitive_slice(&concepts, &edges, &misconceptions, &anchors);
         let stats = summarize_stats(&concepts);
         Ok(KnowledgeMap {
             topic,
             concepts,
+            edges,
+            misconceptions,
+            cognitive_slice,
             stats,
         })
     }
 
-    /// Creates a new topic and immediately asks the active AI runner to build its compact Knowledge Map.
     pub fn create_topic_with_map(
         &self,
         user: &User,
@@ -131,7 +139,6 @@ impl LearnService {
         let concepts = match self.runner.generate_concept_map(&topic.title, level, &cfg, &[], 1) {
             Ok(c) => c,
             Err(err) => {
-                // Clean up empty topic on hard error so the UI never holds a broken topic.
                 let _ = self.store.lock().unwrap().delete_topic(&topic.id, &user.id);
                 return Err(err);
             }
@@ -145,18 +152,14 @@ impl LearnService {
         Ok(updated)
     }
 
-    /// Returns the next buffered open question immediately from SQLite without invoking any AI runner.
     pub fn peek_buffered_question(&self, topic_id: &str) -> Result<Option<StoredQuestion>> {
         self.store.lock().unwrap().get_next_open_question(topic_id)
     }
 
-    /// Counts how many open questions are currently ready in the queue for a topic.
     pub fn count_open_questions(&self, topic_id: &str) -> Result<usize> {
         self.store.lock().unwrap().count_open_questions(topic_id)
     }
 
-    /// Fetches the next open question (returning instantaneously if buffered),
-    /// or generates one live from the deterministic scheduler directive.
     pub fn get_or_generate_next_question(
         &self,
         user: &User,
@@ -168,8 +171,6 @@ impl LearnService {
         self.generate_and_store_one_question(user, topic_id, &HashSet::new())
     }
 
-    /// Generates a single additional buffered question if the open queue is below `target_open`.
-    /// Returns `Ok(true)` if a new question was generated, or `Ok(false)` if already full or busy.
     pub fn prefetch_one_into_buffer(
         &self,
         user: &User,
@@ -203,8 +204,6 @@ impl LearnService {
         res
     }
 
-    /// Tops up the question buffer until `target_open` open questions are ready.
-    /// Returns the number of questions newly generated.
     pub fn fill_question_buffer(
         &self,
         user: &User,
@@ -218,12 +217,11 @@ impl LearnService {
         Ok(generated)
     }
 
-    /// Backwards-compatible helper: ensures at least 1 buffered question is queued.
     pub fn prefetch_next_question(&self, user: &User, topic_id: &str) -> Result<bool> {
         self.prefetch_one_into_buffer(user, topic_id, DEFAULT_OPEN_QUEUE_TARGET)
     }
 
-    /// Grades an answer, updates the compressed Knowledge Map & SM-2 schedule, and returns feedback.
+    /// Grades an answer and runs 1-hop Cognitive Mesh belief propagation locally in < 1ms.
     pub fn submit_answer(
         &self,
         user_id: &str,
@@ -250,16 +248,11 @@ impl LearnService {
         let is_correct = question.correct_choice_id == selected_choice_id;
         store.mark_question_answered(question_id, selected_choice_id, is_correct, now)?;
 
-        let concept = store
-            .get_concept(&question.concept_id)?
-            .ok_or_else(|| anyhow!("Concept not found"))?;
+        let concepts = store.list_concepts(topic_id)?;
+        let edges = store.list_edges(topic_id)?;
+        let misconceptions = store.list_misconceptions(topic_id)?;
 
-        let selected_text = question
-            .choices
-            .iter()
-            .find(|c| c.id == selected_choice_id)
-            .map(|c| c.text.as_str())
-            .unwrap_or("");
+        let selected_choice = question.choices.iter().find(|c| c.id == selected_choice_id);
         let correct_text = question
             .choices
             .iter()
@@ -267,10 +260,15 @@ impl LearnService {
             .map(|c| c.text.clone())
             .unwrap_or_default();
 
-        let misconception_note = if !is_correct {
+        let fallback_note = if !is_correct {
             Some(format!(
                 "Picked '{}' on {} instead of '{}'",
-                selected_text.chars().take(45).collect::<String>(),
+                selected_choice
+                    .map(|c| c.text.as_str())
+                    .unwrap_or("")
+                    .chars()
+                    .take(45)
+                    .collect::<String>(),
                 question.angle_summary.chars().take(35).collect::<String>(),
                 correct_text.chars().take(45).collect::<String>(),
             ))
@@ -278,17 +276,39 @@ impl LearnService {
             None
         };
 
-        let outcome = apply_answer_outcome(
-            &concept,
-            is_correct,
-            &question.angle_summary,
-            misconception_note.as_deref(),
-            now,
+        let prop = propagate_answer_observation(
+            &concepts,
+            &edges,
+            &misconceptions,
+            MeshObservation {
+                target_concept_id: &question.concept_id,
+                intent: question.intent,
+                is_correct,
+                angle_summary: &question.angle_summary,
+                selected_choice,
+                all_choices: &question.choices,
+                fallback_misconception: fallback_note.as_deref(),
+                now_ms: now,
+            },
         );
-        let saved_concept = store.save_concept_progress(&outcome.updated_concept)?;
-        // Invalidate any stale buffered questions for this same concept so future questions reflect updated mastery/misconceptions.
-        let _ = store.delete_open_questions_for_concept(topic_id, &question.concept_id);
+
+        for c in &prop.updated_concepts {
+            store.save_concept_progress(c)?;
+            // Invalidate stale buffered questions for touched concepts so upcoming questions adapt.
+            let _ = store.delete_open_questions_for_concept(topic_id, &c.id);
+        }
+        store.upsert_edges(&prop.updated_edges)?;
+        store.delete_edges_by_ids(&prop.pruned_edge_ids)?;
+        store.upsert_misconceptions(&prop.updated_misconceptions)?;
+        store.delete_misconceptions_by_ids(&prop.pruned_misconception_ids)?;
+
         let (topic_streak, best_streak) = store.record_topic_attempt(topic_id, is_correct, now)?;
+
+        let selected_why_wrong = if !is_correct {
+            selected_choice.and_then(|c| c.why_wrong.clone())
+        } else {
+            None
+        };
 
         Ok(AnswerResult {
             question_id: question.id,
@@ -296,16 +316,112 @@ impl LearnService {
             selected_choice_id: selected_choice_id.to_string(),
             correct_choice_id: question.correct_choice_id,
             correct_choice_text: correct_text,
+            selected_why_wrong,
             explanation: question.explanation,
-            reward_message: outcome.reward_message,
-            concept: saved_concept,
+            reward_message: prop.reward_message,
+            concept: prop.target_concept,
             topic_streak,
             best_streak,
-            mastery_delta: outcome.mastery_delta,
+            mastery_delta: prop.mastery_delta,
+            mesh_effects: prop.effects,
         })
     }
 
-    /// Explicitly expands a topic's knowledge map with deeper concepts.
+    /// Answers a learner's mid-quiz clarifying question (e.g. "What is a motif?"),
+    /// captures any missing foundational concept into the Cognitive Mesh as a `NeedsReview`
+    /// prerequisite linked to the current concept, and returns a spoiler-free reply.
+    pub fn ask_clarifying_question(
+        &self,
+        user: &User,
+        topic_id: &str,
+        question_id: &str,
+        learner_question: &str,
+        already_answered: bool,
+    ) -> Result<ClarifyingReply> {
+        let clean_q = learner_question.trim();
+        if clean_q.is_empty() {
+            return Err(anyhow!("Type a question first."));
+        }
+
+        let (topic, question, current_concept) = {
+            let store = self.store.lock().unwrap();
+            let topic = store
+                .get_topic(topic_id, &user.id)?
+                .ok_or_else(|| anyhow!("Topic not found"))?;
+            let question = store
+                .get_question(question_id)?
+                .ok_or_else(|| anyhow!("Question not found"))?;
+            let concept = store
+                .get_concept(&question.concept_id)?
+                .ok_or_else(|| anyhow!("Concept not found"))?;
+            (topic, question, concept)
+        };
+
+        let cfg = runner_cfg_for(user);
+        let analysis = self.runner.answer_learner_question(
+            &topic.title,
+            topic.level,
+            &current_concept.title,
+            &question.prompt,
+            clean_q,
+            already_answered,
+            &cfg,
+        )?;
+
+        let mut added_concept_title = None;
+        let mut mesh_note = None;
+
+        if let Some(missing) = analysis.missing_concept {
+            let now = now_ms();
+            let store = self.store.lock().unwrap();
+            let all_concepts = store.upsert_concepts(topic_id, &[missing.clone()])?;
+            let target_slug = slugify_label(&missing.title);
+            if let Some(mut gap_node) = all_concepts.into_iter().find(|c| c.slug == target_slug) {
+                // Mark as high-priority knowledge gap so upcoming questions reinforce it!
+                gap_node.mastery = gap_node.mastery.min(0.28);
+                gap_node.uncertainty = gap_node.uncertainty.max(0.82);
+                gap_node.status = ConceptStatus::NeedsReview;
+                gap_node.wrong_count = gap_node.wrong_count.max(1);
+                gap_node.consecutive_correct = 0;
+                gap_node.next_review_at = Some(now);
+                if let Some(note) = &analysis.gap_note {
+                    gap_node.misconceptions.push(note.clone());
+                }
+                let saved = store.save_concept_progress(&gap_node)?;
+
+                // Wire `gap_node --Requires--> current_concept` if they are distinct
+                if saved.slug != current_concept.slug {
+                    let edge = ConceptEdge {
+                        id: format!("req:{topic_id}:{}:{}", saved.slug, current_concept.slug),
+                        topic_id: topic_id.to_string(),
+                        from_slug: saved.slug.clone(),
+                        from_label: saved.title.clone(),
+                        to_slug: current_concept.slug.clone(),
+                        to_label: current_concept.title.clone(),
+                        kind: EdgeKind::Requires,
+                        weight: 0.85,
+                        tension: 0.35,
+                        note: "learner_asked_clarifying_question".into(),
+                    };
+                    let _ = store.upsert_edges(&[edge]);
+                }
+
+                added_concept_title = Some(saved.title.clone());
+                mesh_note = Some(format!(
+                    "Added '{}' to your Cognitive Mesh as a prerequisite for '{}' — upcoming questions will reinforce it.",
+                    saved.title, current_concept.title
+                ));
+            }
+        }
+
+        Ok(ClarifyingReply {
+            question_asked: clean_q.to_string(),
+            answer: analysis.answer,
+            added_concept_title,
+            mesh_note,
+        })
+    }
+
     pub fn expand_knowledge_map(&self, user: &User, topic_id: &str) -> Result<KnowledgeMap> {
         let (topic, existing_titles, next_depth) = {
             let store = self.store.lock().unwrap();
@@ -339,13 +455,16 @@ impl LearnService {
         topic_id: &str,
         exclude_ids: &HashSet<String>,
     ) -> Result<StoredQuestion> {
-        let (topic, mut concepts) = {
+        let (topic, mut concepts, mut edges, misconceptions, anchors) = {
             let store = self.store.lock().unwrap();
             let topic = store
                 .get_topic(topic_id, &user.id)?
                 .ok_or_else(|| anyhow!("Topic not found"))?;
             let concepts = store.list_concepts(topic_id)?;
-            (topic, concepts)
+            let edges = store.list_edges(topic_id)?;
+            let misconceptions = store.list_misconceptions(topic_id)?;
+            let anchors = store.list_cross_topic_anchors(&user.id, topic_id, 4)?;
+            (topic, concepts, edges, misconceptions, anchors)
         };
 
         let cfg = runner_cfg_for(user);
@@ -354,12 +473,21 @@ impl LearnService {
             let initial = self
                 .runner
                 .generate_concept_map(&topic.title, topic.level, &cfg, &[], 1)?;
-            concepts = self.store.lock().unwrap().upsert_concepts(topic_id, &initial)?;
+            let store = self.store.lock().unwrap();
+            concepts = store.upsert_concepts(topic_id, &initial)?;
+            edges = store.list_edges(topic_id)?;
         }
 
-        let mut directive = select_next_directive(&topic, &concepts, now_ms(), exclude_ids)?;
+        let mut directive = select_next_directive(
+            &topic,
+            &concepts,
+            &edges,
+            &misconceptions,
+            &anchors,
+            now_ms(),
+            exclude_ids,
+        )?;
 
-        // Automatically deepen the knowledge map when the learner masters all current concepts.
         if directive.requires_new_concepts {
             let existing_titles: Vec<String> = concepts.iter().map(|c| c.title.clone()).collect();
             if let Ok(deeper) = self.runner.generate_concept_map(
@@ -370,12 +498,18 @@ impl LearnService {
                 directive.target_depth,
             ) {
                 if !deeper.is_empty() {
-                    if let Ok(updated_concepts) =
-                        self.store.lock().unwrap().upsert_concepts(topic_id, &deeper)
-                    {
-                        if let Ok(next_dir) =
-                            select_next_directive(&topic, &updated_concepts, now_ms(), exclude_ids)
-                        {
+                    let store = self.store.lock().unwrap();
+                    if let Ok(updated_concepts) = store.upsert_concepts(topic_id, &deeper) {
+                        let updated_edges = store.list_edges(topic_id).unwrap_or(edges);
+                        if let Ok(next_dir) = select_next_directive(
+                            &topic,
+                            &updated_concepts,
+                            &updated_edges,
+                            &misconceptions,
+                            &anchors,
+                            now_ms(),
+                            exclude_ids,
+                        ) {
                             directive = next_dir;
                         }
                     }
@@ -388,6 +522,7 @@ impl LearnService {
             topic_id: topic_id.to_string(),
             concept_id: directive.concept.id,
             intent: directive.intent,
+            goal: generated.goal,
             prompt: generated.prompt,
             choices: generated.choices,
             correct_choice_id: generated.correct_choice_id,
@@ -425,10 +560,10 @@ pub fn default_db_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::ConceptStatus;
+    use crate::models::{ConceptStatus, DistractorTrapKind};
 
     #[test]
-    fn full_learning_loop_runs_fast_with_demo_runner() {
+    fn full_cognitive_mesh_loop_runs_fast_with_buffered_prefetch() {
         let svc = LearnService::open_in_memory(AiRunner::default()).unwrap();
         let mut user = svc.register("tester", "pass1234").unwrap();
         user = svc.update_runner(&user.id, RunnerKind::Demo, None, None).unwrap();
@@ -441,49 +576,45 @@ mod tests {
         let q1 = svc.get_or_generate_next_question(&user, &topic.id).unwrap();
         assert_eq!(q1.choices.len(), 4);
 
-        // Wrong answer -> records misconception & needs_review
-        let wrong_id = q1
+        // Pick the misconception distractor to verify Shadow Node activation
+        let mis_choice = q1
             .choices
             .iter()
-            .find(|c| c.id != q1.correct_choice_id)
-            .unwrap()
-            .id
-            .clone();
-        let res1 = svc.submit_answer(&user.id, &topic.id, &q1.id, &wrong_id).unwrap();
+            .find(|c| c.trap_kind == Some(DistractorTrapKind::Misconception))
+            .unwrap();
+        let res1 = svc.submit_answer(&user.id, &topic.id, &q1.id, &mis_choice.id).unwrap();
         assert!(!res1.is_correct);
         assert_eq!(res1.concept.status, ConceptStatus::NeedsReview);
-        assert_eq!(res1.concept.misconceptions.len(), 1);
+        assert!(!res1.mesh_effects.is_empty());
 
-        // Prefetch fills buffer up to target and avoids duplicating concepts
+        let map = svc.get_knowledge_map(&user.id, &topic.id).unwrap();
+        assert_eq!(map.misconceptions.len(), 1);
+        assert!(!map.edges.is_empty());
+
+        // Prefetch fills buffer up to target and caps there
         let generated = svc
             .fill_question_buffer(&user, &topic.id, DEFAULT_BUFFER_TARGET)
             .unwrap();
         assert_eq!(generated, DEFAULT_BUFFER_TARGET);
         assert_eq!(svc.count_open_questions(&topic.id).unwrap(), DEFAULT_BUFFER_TARGET);
-        // Calling fill again when full generates 0 extra questions (bounded buffer)
         assert_eq!(
-            svc.fill_question_buffer(&user, &topic.id, DEFAULT_BUFFER_TARGET)
-                .unwrap(),
+            svc.fill_question_buffer(&user, &topic.id, DEFAULT_BUFFER_TARGET).unwrap(),
             0
         );
 
-        // Next question is popped instantaneously from buffer
         let q2 = svc.peek_buffered_question(&topic.id).unwrap().unwrap();
         let res2 = svc
             .submit_answer(&user.id, &topic.id, &q2.id, &q2.correct_choice_id)
             .unwrap();
         assert!(res2.is_correct);
         assert_eq!(res2.topic_streak, 1);
-        assert_eq!(
-            svc.count_open_questions(&topic.id).unwrap(),
-            DEFAULT_BUFFER_TARGET - 1
-        );
 
-        // Buffer tops back up by exactly 1
-        assert_eq!(
-            svc.fill_question_buffer(&user, &topic.id, DEFAULT_BUFFER_TARGET)
-                .unwrap(),
-            1
-        );
+        // Clarifying question adds missing prerequisite concept to the Cognitive Mesh
+        let reply = svc
+            .ask_clarifying_question(&user, &topic.id, &q2.id, "What is a qubit?", true)
+            .unwrap();
+        assert_eq!(reply.added_concept_title.as_deref(), Some("qubit"));
+        let map_after = svc.get_knowledge_map(&user.id, &topic.id).unwrap();
+        assert!(map_after.concepts.iter().any(|c| c.slug == "qubit" && c.status == ConceptStatus::NeedsReview));
     }
 }

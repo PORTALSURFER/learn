@@ -3,12 +3,12 @@ use gpui::{
     WeakEntity, Window, div, prelude::*, px,
 };
 use learn_core::{
-    AnswerResult, ConceptNode, ConceptStatus, DEFAULT_BUFFER_TARGET, DEFAULT_OPEN_QUEUE_TARGET,
-    DetectedRunner, KnowledgeMap, LearnService, QuestionIntent, RunnerKind, SkillLevel,
-    StoredQuestion, TopicSummary, User,
+    AnswerResult, ClarifyingReply, ConceptNode, ConceptStatus, DEFAULT_BUFFER_TARGET,
+    DEFAULT_OPEN_QUEUE_TARGET, DetectedRunner, EdgeKind, KnowledgeMap, LearnService,
+    QuestionIntent, RunnerKind, SkillLevel, StoredQuestion, TopicSummary, User,
 };
 
-use crate::theme;
+use crate::{CloseWindow, QuitApp, theme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
@@ -24,6 +24,7 @@ enum ActiveField {
     AuthUsername,
     AuthPassword,
     NewTopic,
+    QuizClarify,
     GeminiKey,
     OpenaiKey,
 }
@@ -60,6 +61,9 @@ pub struct LearnApp {
     prefetching: bool,
     prefetch_topic_id: Option<String>,
     buffered_ready: usize,
+    clarify_input: String,
+    clarify_busy: bool,
+    clarify_replies: Vec<ClarifyingReply>,
     error_banner: Option<String>,
     info_banner: Option<String>,
 }
@@ -103,6 +107,9 @@ impl LearnApp {
             prefetching: false,
             prefetch_topic_id: None,
             buffered_ready: 0,
+            clarify_input: String::new(),
+            clarify_busy: false,
+            clarify_replies: Vec::new(),
             error_banner: None,
             info_banner: None,
         }
@@ -131,7 +138,6 @@ impl LearnApp {
                 self.user = Some(user);
                 self.route = Route::Dashboard;
                 self.active_field = ActiveField::NewTopic;
-                // Pre-warm the question buffer for the most recent topic right after sign-in.
                 if let Some(first_topic) = self.topics.first() {
                     self.start_buffer_refill_for(first_topic.id.clone(), DEFAULT_BUFFER_TARGET, cx);
                 }
@@ -178,8 +184,6 @@ impl LearnApp {
             return;
         };
         let open = self.service.count_open_questions(topic_id).unwrap_or(0);
-        // If an unanswered question is currently displayed on screen, subtract 1 so
-        // `buffered_ready` reflects strictly how many *next* questions are ready ahead.
         let active_open = usize::from(self.current_question.is_some() && self.last_answer.is_none());
         self.buffered_ready = open.saturating_sub(active_open).min(DEFAULT_BUFFER_TARGET);
     }
@@ -214,7 +218,7 @@ impl LearnApp {
         self.error_banner = None;
         self.info_banner = None;
         self.busy_message = Some(format!(
-            "Asking {} to build your Knowledge Map for \"{}\"...",
+            "Asking {} to build your Cognitive Mesh Knowledge Map for \"{}\"...",
             user.runner.label(),
             title
         ));
@@ -265,10 +269,12 @@ impl LearnApp {
         self.route = Route::Quiz;
         self.active_field = ActiveField::None;
         self.last_answer = None;
+        self.clarify_input.clear();
+        self.clarify_busy = false;
+        self.clarify_replies.clear();
         self.error_banner = None;
         self.knowledge_map = self.service.get_knowledge_map(&user.id, &topic_id).ok();
 
-        // Instant path: if a question is already ready in the buffer, show it immediately with zero wait!
         if let Ok(Some(ready_q)) = self.service.peek_buffered_question(&topic_id) {
             self.current_question = Some(ready_q);
             self.refresh_buffer_count();
@@ -277,7 +283,6 @@ impl LearnApp {
             return;
         }
 
-        // Slow path only when the buffer is completely empty.
         self.current_question = None;
         self.buffered_ready = 0;
         self.busy_message = Some(format!(
@@ -354,7 +359,6 @@ impl LearnApp {
             Ok(result) => {
                 self.last_answer = Some(result);
                 self.refresh_topics();
-                // Immediately start generating the next question while the user reads feedback!
                 self.trigger_background_prefetch(cx);
             }
             Err(err) => {
@@ -367,6 +371,57 @@ impl LearnApp {
     fn load_next_question(&mut self, cx: &mut Context<Self>) {
         let Some(topic_id) = self.active_topic_id.clone() else { return };
         self.open_topic_quiz(topic_id, cx);
+    }
+
+    fn submit_clarifying_question(&mut self, cx: &mut Context<Self>) {
+        let Some(user) = self.user.clone() else { return };
+        let Some(topic_id) = self.active_topic_id.clone() else { return };
+        let Some(question) = self.current_question.clone() else { return };
+        let prompt_text = self.clarify_input.trim().to_string();
+        if prompt_text.is_empty() || self.clarify_busy {
+            return;
+        }
+
+        let already_answered = self.last_answer.is_some();
+        let service = self.service.clone();
+        self.clarify_busy = true;
+        self.clarify_input.clear();
+        self.active_field = ActiveField::None;
+        self.error_banner = None;
+        cx.notify();
+
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    service.ask_clarifying_question(
+                        &user,
+                        &topic_id,
+                        &question.id,
+                        &prompt_text,
+                        already_answered,
+                    )
+                })
+                .await;
+
+            this.update(cx, |view, cx| {
+                view.clarify_busy = false;
+                match res {
+                    Ok(reply) => {
+                        view.clarify_replies.push(reply);
+                        view.refresh_topics();
+                        // Immediately refill buffer so a follow-up question on the gap can be scheduled
+                        view.trigger_background_prefetch(cx);
+                    }
+                    Err(err) => {
+                        view.error_banner = Some(err.to_string());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn trigger_background_prefetch(&mut self, cx: &mut Context<Self>) {
@@ -415,8 +470,11 @@ impl LearnApp {
                 let updated = this.update(cx, |view, cx| {
                     view.refresh_buffer_count();
 
-                    // Stop if user signed out, switched runners, or changed topic
-                    let same_user = view.user.as_ref().map(|u| u.id == user.id && u.runner == user.runner).unwrap_or(false);
+                    let same_user = view
+                        .user
+                        .as_ref()
+                        .map(|u| u.id == user.id && u.runner == user.runner)
+                        .unwrap_or(false);
                     let still_relevant = view.active_topic_id.is_none()
                         || view.active_topic_id.as_deref() == Some(topic_id.as_str());
 
@@ -428,11 +486,9 @@ impl LearnApp {
                         }
                     }
 
-                    if !keep_going {
-                        if view.prefetch_topic_id.as_deref() == Some(topic_id.as_str()) {
-                            view.prefetching = false;
-                            view.prefetch_topic_id = None;
-                        }
+                    if !keep_going && view.prefetch_topic_id.as_deref() == Some(topic_id.as_str()) {
+                        view.prefetching = false;
+                        view.prefetch_topic_id = None;
                     }
                     cx.notify();
                 });
@@ -454,7 +510,7 @@ impl LearnApp {
         let service = self.service.clone();
         self.error_banner = None;
         self.busy_message = Some(format!(
-            "Asking {} to deepen your Knowledge Map...",
+            "Asking {} to deepen your Cognitive Mesh Knowledge Map...",
             user.runner.label()
         ));
         cx.notify();
@@ -471,7 +527,7 @@ impl LearnApp {
                     Ok(map) => {
                         view.knowledge_map = Some(map);
                         view.refresh_topics();
-                        view.info_banner = Some("Added deeper concepts to your Knowledge Map.".into());
+                        view.info_banner = Some("Added deeper concepts and prerequisite edges.".into());
                     }
                     Err(err) => {
                         view.error_banner = Some(err.to_string());
@@ -544,22 +600,25 @@ impl LearnApp {
             ActiveField::AuthUsername => Some(&mut self.auth_username),
             ActiveField::AuthPassword => Some(&mut self.auth_password),
             ActiveField::NewTopic => Some(&mut self.new_topic_title),
+            ActiveField::QuizClarify => Some(&mut self.clarify_input),
             ActiveField::GeminiKey => Some(&mut self.gemini_key_input),
             ActiveField::OpenaiKey => Some(&mut self.openai_key_input),
         }
     }
 
-    fn handle_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
         let cmd_or_ctrl = ks.modifiers.platform || ks.modifiers.control;
 
-        // Cmd+Q / Ctrl+Q to quit cleanly
         if cmd_or_ctrl && ks.key.eq_ignore_ascii_case("q") {
             cx.quit();
             return;
         }
+        if cmd_or_ctrl && ks.key.eq_ignore_ascii_case("w") {
+            window.remove_window();
+            return;
+        }
 
-        // Cmd+V paste into active text input
         if cmd_or_ctrl && ks.key.eq_ignore_ascii_case("v") {
             if let Some(clip) = cx.read_from_clipboard().and_then(|c| c.text()) {
                 let clean = clip.replace(['\r', '\n'], " ");
@@ -571,7 +630,6 @@ impl LearnApp {
             return;
         }
 
-        // Quiz keyboard shortcuts when no text input is focused
         if self.user.is_some() && self.route == Route::Quiz && self.active_field == ActiveField::None {
             if self.last_answer.is_none() {
                 match ks.key.as_str() {
@@ -599,7 +657,6 @@ impl LearnApp {
             }
         }
 
-        // Tab cycling on auth screen
         if self.user.is_none() && ks.key == "tab" {
             self.active_field = match self.active_field {
                 ActiveField::AuthUsername => ActiveField::AuthPassword,
@@ -609,11 +666,11 @@ impl LearnApp {
             return;
         }
 
-        // Enter submits active form
         if ks.key == "enter" {
             match self.active_field {
                 ActiveField::AuthUsername | ActiveField::AuthPassword => self.submit_auth(cx),
                 ActiveField::NewTopic => self.create_topic(cx),
+                ActiveField::QuizClarify => self.submit_clarifying_question(cx),
                 ActiveField::GeminiKey | ActiveField::OpenaiKey => self.save_api_keys(cx),
                 ActiveField::None => {}
             }
@@ -634,7 +691,6 @@ impl LearnApp {
             return;
         }
 
-        // Printable characters
         if !cmd_or_ctrl && !ks.modifiers.alt {
             if let Some(ch) = &ks.key_char {
                 if !ch.is_empty() && !ch.chars().all(|c| c.is_control()) {
@@ -679,8 +735,10 @@ impl LearnApp {
             .flex_col()
             .gap_1()
             .w_full()
+            .min_w_0()
             .child(
                 div()
+                    .w_full()
                     .text_xs()
                     .text_color(theme::text_secondary())
                     .child(label.to_string()),
@@ -689,10 +747,13 @@ impl LearnApp {
                 div()
                     .id(id)
                     .w_full()
-                    .h(px(40.0))
+                    .min_w_0()
+                    .min_h(px(40.0))
                     .px_3()
+                    .py_2()
                     .flex()
                     .items_center()
+                    .overflow_hidden()
                     .rounded_md()
                     .bg(theme::bg_input())
                     .border_1()
@@ -709,6 +770,8 @@ impl LearnApp {
                     }))
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .text_sm()
                             .text_color(if is_placeholder {
                                 theme::text_muted()
@@ -733,6 +796,7 @@ impl LearnApp {
             return Some(
                 div()
                     .w_full()
+                    .min_w_0()
                     .px_4()
                     .py_3()
                     .rounded_md()
@@ -749,6 +813,7 @@ impl LearnApp {
             return Some(
                 div()
                     .w_full()
+                    .min_w_0()
                     .px_4()
                     .py_3()
                     .rounded_md()
@@ -769,12 +834,18 @@ impl LearnApp {
     fn render_auth(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let detected_cli = self.runners.iter().find(|r| r.is_cli && r.available);
         let subtitle = match detected_cli {
-            Some(r) => format!("Local AI detected: {} ({})", r.label, r.version.as_deref().unwrap_or("ready")),
-            None => "Local-first adaptive learning · connect Codex CLI, Antigravity CLI, or API keys".to_string(),
+            Some(r) => format!(
+                "Local AI detected: {} ({})",
+                r.label,
+                r.version.as_deref().unwrap_or("ready")
+            ),
+            None => "Local-first Cognitive Mesh · connect Codex CLI, Antigravity CLI, or API keys"
+                .to_string(),
         };
 
         let mut card = div()
             .w(px(440.0))
+            .max_w_full()
             .p_7()
             .rounded_xl()
             .bg(theme::bg_card())
@@ -788,6 +859,8 @@ impl LearnApp {
                     .flex()
                     .flex_col()
                     .gap_1()
+                    .w_full()
+                    .min_w_0()
                     .child(
                         div()
                             .text_2xl()
@@ -799,7 +872,7 @@ impl LearnApp {
                         div()
                             .text_sm()
                             .text_color(theme::text_secondary())
-                            .child("Live AI-generated quizzes & compressed Knowledge Maps"),
+                            .child("Neuro-symbolic Cognitive Mesh & live AI adaptive training"),
                     )
                     .child(
                         div()
@@ -813,7 +886,6 @@ impl LearnApp {
                             .child(subtitle),
                     ),
             )
-            // Mode switch tabs
             .child(
                 div()
                     .flex()
@@ -964,7 +1036,7 @@ impl LearnApp {
                     .justify_center()
                     .text_sm()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(gpui::white())
+                    .text_color(theme::pure_white())
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.submit_auth(cx);
                     }))
@@ -976,13 +1048,17 @@ impl LearnApp {
             )
             .child(
                 div()
+                    .w_full()
                     .text_xs()
                     .text_color(theme::text_muted())
                     .child("Stored locally in ~/.learn-iocore/learn.db · Tab switches fields · Enter submits"),
             );
 
         div()
+            .id("auth-scroll")
             .size_full()
+            .overflow_y_scroll()
+            .p_6()
             .flex()
             .items_center()
             .justify_center()
@@ -993,7 +1069,11 @@ impl LearnApp {
     // ---------- Main Shell: Sidebar ----------
 
     fn render_sidebar(&self, user: &User, cx: &mut Context<Self>) -> impl IntoElement {
-        let nav_btn = |id: &'static str, label: &'static str, target: Route, active: bool, cx: &mut Context<Self>| {
+        let nav_btn = |id: &'static str,
+                       label: &'static str,
+                       target: Route,
+                       active: bool,
+                       cx: &mut Context<Self>| {
             div()
                 .id(id)
                 .w_full()
@@ -1031,7 +1111,16 @@ impl LearnApp {
                 .child(label)
         };
 
-        let mut topic_list = div().flex().flex_col().gap_1().mt_1();
+        let mut topic_list = div()
+            .id("sidebar-topics-scroll")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .mt_1()
+            .w_full()
+            .min_w_0()
+            .overflow_y_scroll();
+
         for (idx, topic) in self.topics.iter().enumerate() {
             let tid = topic.id.clone();
             let is_selected = self.active_topic_id.as_deref() == Some(topic.id.as_str());
@@ -1040,6 +1129,7 @@ impl LearnApp {
                 div()
                     .id(("sidebar-topic", idx))
                     .w_full()
+                    .min_w_0()
                     .px_3()
                     .py_2()
                     .rounded_md()
@@ -1051,7 +1141,7 @@ impl LearnApp {
                     })
                     .hover(|s| s.bg(theme::bg_card_hover()))
                     .flex()
-                    .items_center()
+                    .items_start()
                     .justify_between()
                     .gap_2()
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -1059,6 +1149,8 @@ impl LearnApp {
                     }))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .text_xs()
                             .text_color(if is_selected {
                                 theme::text_primary()
@@ -1069,6 +1161,7 @@ impl LearnApp {
                     )
                     .child(
                         div()
+                            .flex_shrink_0()
                             .text_xs()
                             .text_color(theme::emerald_text())
                             .child(format!("{pct}%")),
@@ -1078,16 +1171,22 @@ impl LearnApp {
 
         let mut sidebar = div()
             .w(px(250.0))
+            .flex_shrink_0()
             .h_full()
+            .overflow_hidden()
             .bg(theme::bg_sidebar())
             .border_r_1()
             .border_color(theme::border_subtle())
             .p_4()
             .flex()
             .flex_col()
-            .justify_between();
+            .justify_between()
+            .gap_3();
 
         let mut top = div()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
             .flex()
             .flex_col()
             .gap_3()
@@ -1096,6 +1195,8 @@ impl LearnApp {
                     .flex()
                     .flex_col()
                     .gap_1()
+                    .w_full()
+                    .min_w_0()
                     .child(
                         div()
                             .text_lg()
@@ -1108,14 +1209,19 @@ impl LearnApp {
                             .flex()
                             .items_center()
                             .gap_2()
+                            .w_full()
+                            .min_w_0()
                             .child(
                                 div()
                                     .size(px(8.0))
+                                    .flex_shrink_0()
                                     .rounded_full()
                                     .bg(theme::emerald()),
                             )
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w_0()
                                     .text_xs()
                                     .text_color(theme::text_secondary())
                                     .child(format!("{} · {}", user.username, user.runner.label())),
@@ -1128,18 +1234,45 @@ impl LearnApp {
                     .flex_col()
                     .gap_1()
                     .mt_2()
-                    .child(nav_btn("nav-dashboard", "Topics & Dashboard", Route::Dashboard, self.route == Route::Dashboard, cx))
+                    .child(nav_btn(
+                        "nav-dashboard",
+                        "Topics & Dashboard",
+                        Route::Dashboard,
+                        self.route == Route::Dashboard,
+                        cx,
+                    ))
                     .when(self.active_topic_id.is_some(), |el| {
-                        el.child(nav_btn("nav-quiz", "Live Quiz Arena", Route::Quiz, self.route == Route::Quiz, cx))
-                            .child(nav_btn("nav-map", "Knowledge Map", Route::KnowledgeMap, self.route == Route::KnowledgeMap, cx))
+                        el.child(nav_btn(
+                            "nav-quiz",
+                            "Live Quiz Arena",
+                            Route::Quiz,
+                            self.route == Route::Quiz,
+                            cx,
+                        ))
+                        .child(nav_btn(
+                            "nav-map",
+                            "Cognitive Mesh Map",
+                            Route::KnowledgeMap,
+                            self.route == Route::KnowledgeMap,
+                            cx,
+                        ))
                     })
-                    .child(nav_btn("nav-settings", "AI Runners & Settings", Route::Settings, self.route == Route::Settings, cx)),
+                    .child(nav_btn(
+                        "nav-settings",
+                        "AI Runners & Settings",
+                        Route::Settings,
+                        self.route == Route::Settings,
+                        cx,
+                    )),
             );
 
         if !self.topics.is_empty() {
             top = top.child(
                 div()
-                    .mt_4()
+                    .mt_3()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -1158,6 +1291,7 @@ impl LearnApp {
         sidebar = sidebar.child(top).child(
             div()
                 .id("btn-signout")
+                .flex_shrink_0()
                 .w_full()
                 .px_3()
                 .py_2()
@@ -1217,7 +1351,8 @@ impl LearnApp {
         let mut container = div()
             .id("dashboard-scroll")
             .size_full()
-            .overflow_scroll()
+            .min_w_0()
+            .overflow_y_scroll()
             .p_8()
             .flex()
             .flex_col()
@@ -1231,6 +1366,7 @@ impl LearnApp {
             container = container.child(
                 div()
                     .w_full()
+                    .min_w_0()
                     .px_4()
                     .py_3()
                     .rounded_md()
@@ -1243,10 +1379,10 @@ impl LearnApp {
             );
         }
 
-        // Hero prompt card
         container = container.child(
             div()
                 .w_full()
+                .min_w_0()
                 .p_6()
                 .rounded_xl()
                 .bg(theme::bg_card())
@@ -1258,36 +1394,32 @@ impl LearnApp {
                 .child(
                     div()
                         .flex()
-                        .items_center()
-                        .justify_between()
+                        .flex_col()
+                        .gap_1()
+                        .w_full()
+                        .min_w_0()
                         .child(
                             div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .text_xl()
-                                        .font_weight(gpui::FontWeight::BOLD)
-                                        .text_color(theme::text_primary())
-                                        .child("What do you want to learn?"),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(theme::text_secondary())
-                                        .child(format!(
-                                            "Active AI engine: {} — generates a live Knowledge Map and adaptive 4-choice questions one by one.",
-                                            user.runner.label()
-                                        )),
-                                ),
+                                .text_xl()
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(theme::text_primary())
+                                .child("What do you want to learn?"),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme::text_secondary())
+                                .child(format!(
+                                    "Active AI engine: {} — builds a Cognitive Mesh with prerequisite edges, confusion synapses, and live buffered 4-choice questions.",
+                                    user.runner.label()
+                                )),
                         ),
                 )
                 .child(self.render_input_box(
                     "input-new-topic",
                     "Topic",
                     &self.new_topic_title,
-                    "e.g. Rust async internals, Options pricing, Japanese particles, Organic chemistry...",
+                    "e.g. Rust async internals, Hypnotic techno production, Options pricing, Organic chemistry...",
                     false,
                     ActiveField::NewTopic,
                     cx,
@@ -1295,12 +1427,14 @@ impl LearnApp {
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .justify_between()
                         .gap_3()
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .items_center()
                                 .gap_2()
                                 .child(
@@ -1324,7 +1458,7 @@ impl LearnApp {
                                 .cursor_pointer()
                                 .text_sm()
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(gpui::white())
+                                .text_color(theme::pure_white())
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                     this.create_topic(cx);
                                 }))
@@ -1333,19 +1467,25 @@ impl LearnApp {
                 ),
         );
 
-        // Existing topics
-        let mut topics_section = div().flex().flex_col().gap_3().child(
-            div()
-                .text_sm()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(theme::text_secondary())
-                .child(format!("Your Learning Tracks ({})", self.topics.len())),
-        );
+        let mut topics_section = div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::text_secondary())
+                    .child(format!("Your Learning Tracks ({})", self.topics.len())),
+            );
 
         if self.topics.is_empty() {
             topics_section = topics_section.child(
                 div()
                     .w_full()
+                    .min_w_0()
                     .p_6()
                     .rounded_xl()
                     .bg(theme::bg_card())
@@ -1353,13 +1493,14 @@ impl LearnApp {
                     .border_color(theme::border_subtle())
                     .text_sm()
                     .text_color(theme::text_muted())
-                    .child("No topics yet. Enter anything above and press Enter to generate your first live Knowledge Map!"),
+                    .child("No topics yet. Enter anything above and press Enter to generate your first Cognitive Mesh Knowledge Map!"),
             );
         } else {
             for (idx, topic) in self.topics.iter().enumerate() {
                 let pct = (topic.average_mastery * 100.0).round() as u32;
                 let acc = if topic.total_attempts > 0 {
-                    ((topic.correct_attempts as f64 / topic.total_attempts as f64) * 100.0).round() as u32
+                    ((topic.correct_attempts as f64 / topic.total_attempts as f64) * 100.0).round()
+                        as u32
                 } else {
                     0
                 };
@@ -1370,6 +1511,7 @@ impl LearnApp {
                 topics_section = topics_section.child(
                     div()
                         .w_full()
+                        .min_w_0()
                         .p_5()
                         .rounded_xl()
                         .bg(theme::bg_card())
@@ -1381,13 +1523,17 @@ impl LearnApp {
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .items_center()
                                 .justify_between()
+                                .gap_2()
                                 .child(
                                     div()
                                         .flex()
+                                        .flex_wrap()
                                         .items_center()
-                                        .gap_3()
+                                        .gap_2()
+                                        .min_w_0()
                                         .child(
                                             div()
                                                 .text_base()
@@ -1412,11 +1558,12 @@ impl LearnApp {
                                         .text_color(theme::emerald_text())
                                         .child(format!(
                                             "{pct}% mastery · {}/{} mastered · streak {}",
-                                            topic.mastered_count, topic.concept_count, topic.current_streak
+                                            topic.mastered_count,
+                                            topic.concept_count,
+                                            topic.current_streak
                                         )),
                                 ),
                         )
-                        // Mastery bar
                         .child(
                             div()
                                 .w_full()
@@ -1426,7 +1573,9 @@ impl LearnApp {
                                 .child(
                                     div()
                                         .h_full()
-                                        .w(gpui::relative((topic.average_mastery as f32).clamp(0.02, 1.0)))
+                                        .w(gpui::relative(
+                                            (topic.average_mastery as f32).clamp(0.02, 1.0),
+                                        ))
                                         .rounded_full()
                                         .bg(theme::emerald()),
                                 ),
@@ -1434,8 +1583,10 @@ impl LearnApp {
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .items_center()
                                 .justify_between()
+                                .gap_2()
                                 .child(
                                     div()
                                         .text_xs()
@@ -1448,6 +1599,7 @@ impl LearnApp {
                                 .child(
                                     div()
                                         .flex()
+                                        .flex_wrap()
                                         .items_center()
                                         .gap_2()
                                         .child(
@@ -1461,10 +1613,12 @@ impl LearnApp {
                                                 .cursor_pointer()
                                                 .text_xs()
                                                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                .text_color(gpui::white())
-                                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                                    this.open_topic_quiz(tid_quiz.clone(), cx);
-                                                }))
+                                                .text_color(theme::pure_white())
+                                                .on_click(cx.listener(
+                                                    move |this, _: &ClickEvent, _, cx| {
+                                                        this.open_topic_quiz(tid_quiz.clone(), cx);
+                                                    },
+                                                ))
                                                 .child("Continue Quiz"),
                                         )
                                         .child(
@@ -1480,10 +1634,12 @@ impl LearnApp {
                                                 .cursor_pointer()
                                                 .text_xs()
                                                 .text_color(theme::text_primary())
-                                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                                    this.open_topic_map(tid_map.clone(), cx);
-                                                }))
-                                                .child("Knowledge Map"),
+                                                .on_click(cx.listener(
+                                                    move |this, _: &ClickEvent, _, cx| {
+                                                        this.open_topic_map(tid_map.clone(), cx);
+                                                    },
+                                                ))
+                                                .child("Cognitive Mesh"),
                                         )
                                         .child(
                                             div()
@@ -1495,9 +1651,11 @@ impl LearnApp {
                                                 .cursor_pointer()
                                                 .text_xs()
                                                 .text_color(theme::rose_text())
-                                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                                    this.delete_topic(tid_del.clone(), cx);
-                                                }))
+                                                .on_click(cx.listener(
+                                                    move |this, _: &ClickEvent, _, cx| {
+                                                        this.delete_topic(tid_del.clone(), cx);
+                                                    },
+                                                ))
                                                 .child("Delete"),
                                         ),
                                 ),
@@ -1515,7 +1673,8 @@ impl LearnApp {
         let mut container = div()
             .id("quiz-scroll")
             .size_full()
-            .overflow_scroll()
+            .min_w_0()
+            .overflow_y_scroll()
             .p_8()
             .flex()
             .flex_col()
@@ -1551,19 +1710,26 @@ impl LearnApp {
             format!("Buffer: {}/{} ready", self.buffered_ready, DEFAULT_BUFFER_TARGET)
         };
 
-        // Top bar
         container = container.child(
             div()
+                .w_full()
+                .min_w_0()
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .justify_between()
+                .gap_3()
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
                         .flex()
                         .flex_col()
-                        .gap_0p5()
+                        .gap_1()
                         .child(
                             div()
+                                .w_full()
+                                .min_w_0()
                                 .text_xl()
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .text_color(theme::text_primary())
@@ -1572,6 +1738,7 @@ impl LearnApp {
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .items_center()
                                 .gap_2()
                                 .child(
@@ -1605,6 +1772,7 @@ impl LearnApp {
                 .child(
                     div()
                         .id("quiz-view-map")
+                        .flex_shrink_0()
                         .px_3()
                         .py_1p5()
                         .rounded_md()
@@ -1620,7 +1788,7 @@ impl LearnApp {
                                 this.open_topic_map(tid, cx);
                             }
                         }))
-                        .child("View Knowledge Map"),
+                        .child("View Cognitive Mesh"),
                 ),
         );
 
@@ -1628,6 +1796,7 @@ impl LearnApp {
             return container.child(
                 div()
                     .w_full()
+                    .min_w_0()
                     .p_8()
                     .rounded_xl()
                     .bg(theme::bg_card())
@@ -1638,6 +1807,8 @@ impl LearnApp {
                     .gap_2()
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .text_base()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme::accent_text())
@@ -1645,6 +1816,8 @@ impl LearnApp {
                     )
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .text_xs()
                             .text_color(theme::text_secondary())
                             .child("Running live on a background worker so the UI stays responsive."),
@@ -1655,6 +1828,8 @@ impl LearnApp {
         let Some(q) = &self.current_question else {
             return container.child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .p_6()
                     .rounded_xl()
                     .bg(theme::bg_card())
@@ -1671,9 +1846,21 @@ impl LearnApp {
             QuestionIntent::DigDeeper => (theme::emerald_soft(), theme::emerald_text()),
         };
 
-        // Question card
+        let node_tuple_label = self
+            .knowledge_map
+            .as_ref()
+            .and_then(|m| m.concepts.iter().find(|c| c.id == q.concept_id))
+            .map(|c| {
+                format!(
+                    "{} · Depth {} · μ {:.2} ± {:.2}",
+                    c.title, c.depth, c.mastery, c.uncertainty
+                )
+            })
+            .unwrap_or_else(|| format!("{} · Depth {}", q.concept_title, q.depth));
+
         let mut q_card = div()
             .w_full()
+            .min_w_0()
             .p_6()
             .rounded_xl()
             .bg(theme::bg_card())
@@ -1684,14 +1871,20 @@ impl LearnApp {
             .gap_5()
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
+                    .gap_2()
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap_2()
+                            .min_w_0()
                             .child(
                                 div()
                                     .px_2p5()
@@ -1711,7 +1904,7 @@ impl LearnApp {
                                     .bg(theme::bg_input())
                                     .text_xs()
                                     .text_color(theme::text_secondary())
-                                    .child(format!("{} · Depth {}", q.concept_title, q.depth)),
+                                    .child(node_tuple_label),
                             ),
                     )
                     .child(
@@ -1721,16 +1914,50 @@ impl LearnApp {
                             .child(format!("via {}", q.source.label())),
                     ),
             )
+            .when(!q.goal.trim().is_empty(), |el| {
+                el.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .px_3p5()
+                        .py_2p5()
+                        .rounded_md()
+                        .bg(theme::bg_input())
+                        .border_l_2()
+                        .border_color(theme::accent())
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme::accent_text())
+                                .child("Goal & Context"),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .text_xs()
+                                .line_height(px(18.0))
+                                .text_color(theme::text_secondary())
+                                .child(q.goal.clone()),
+                        ),
+                )
+            })
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .text_lg()
+                    .line_height(px(28.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme::text_primary())
                     .child(q.prompt.clone()),
             );
 
-        // 4 Choice cards
-        let mut choices_col = div().flex().flex_col().gap_2p5();
+        let mut choices_col = div().w_full().min_w_0().flex().flex_col().gap_2p5();
         for (idx, choice) in q.choices.iter().enumerate() {
             let cid = choice.id.clone();
             let (bg, border, badge_bg, badge_fg) = if let Some(ans) = &self.last_answer {
@@ -1750,6 +1977,7 @@ impl LearnApp {
                 div()
                     .id(("choice", idx))
                     .w_full()
+                    .min_w_0()
                     .p_4()
                     .rounded_lg()
                     .bg(bg)
@@ -1760,7 +1988,7 @@ impl LearnApp {
                             .hover(|s| s.bg(theme::bg_card_hover()).border_color(theme::accent()))
                     })
                     .flex()
-                    .items_center()
+                    .items_start()
                     .gap_3()
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.select_answer(&cid, cx);
@@ -1769,6 +1997,7 @@ impl LearnApp {
                         div()
                             .w(px(28.0))
                             .h(px(28.0))
+                            .flex_shrink_0()
                             .rounded_md()
                             .bg(badge_bg)
                             .flex()
@@ -1782,7 +2011,9 @@ impl LearnApp {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .text_sm()
+                            .line_height(px(21.0))
                             .text_color(theme::text_primary())
                             .child(choice.text.clone()),
                     ),
@@ -1794,6 +2025,8 @@ impl LearnApp {
         if self.last_answer.is_none() {
             q_card = q_card.child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .text_xs()
                     .text_color(theme::text_muted())
                     .child("Tip: click an option or press keys 1–4 (or A–D) to answer"),
@@ -1802,7 +2035,6 @@ impl LearnApp {
 
         container = container.child(q_card);
 
-        // Feedback card (Reward or Error + Explanation + Next Question)
         if let Some(ans) = &self.last_answer {
             let (fb_bg, fb_border, title_fg) = if ans.is_correct {
                 (theme::emerald_soft(), theme::emerald(), theme::emerald_text())
@@ -1811,101 +2043,299 @@ impl LearnApp {
             };
             let delta_pct = (ans.mastery_delta * 100.0).round() as i32;
             let delta_str = if delta_pct >= 0 {
-                format!("+{delta_pct}% mastery")
+                format!("+{delta_pct}% μ")
             } else {
-                format!("{delta_pct}% mastery")
+                format!("{delta_pct}% μ")
             };
 
-            container = container.child(
-                div()
-                    .w_full()
-                    .p_5()
-                    .rounded_xl()
-                    .bg(fb_bg)
-                    .border_1()
-                    .border_color(fb_border)
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(title_fg)
-                                    .child(ans.reward_message.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(title_fg)
-                                    .child(format!(
-                                        "{} ({}) · {}",
-                                        ans.concept.status.label(),
-                                        delta_str,
-                                        format!("{}%", (ans.concept.mastery * 100.0).round() as u32)
-                                    )),
-                            ),
-                    )
-                    .when(!ans.is_correct, |el| {
-                        el.child(
+            let mut fb = div()
+                .w_full()
+                .min_w_0()
+                .p_5()
+                .rounded_xl()
+                .bg(fb_bg)
+                .border_1()
+                .border_color(fb_border)
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
                             div()
-                                .text_sm()
+                                .flex_1()
+                                .min_w_0()
+                                .text_base()
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(title_fg)
+                                .child(ans.reward_message.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(theme::text_primary())
+                                .text_color(title_fg)
                                 .child(format!(
-                                    "Correct answer ({}): {}",
-                                    ans.correct_choice_id, ans.correct_choice_text
+                                    "{} ({}) · μ {:.2} ± {:.2}",
+                                    ans.concept.status.label(),
+                                    delta_str,
+                                    ans.concept.mastery,
+                                    ans.concept.uncertainty
+                                )),
+                        ),
+                )
+                .when(!ans.is_correct, |el| {
+                    el.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(format!(
+                                "Correct answer ({}): {}",
+                                ans.correct_choice_id, ans.correct_choice_text
+                            )),
+                    )
+                    .when_some(ans.selected_why_wrong.clone(), |inner, why| {
+                        inner.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .bg(theme::bg_input())
+                                .border_1()
+                                .border_color(theme::rose())
+                                .text_xs()
+                                .line_height(px(18.0))
+                                .text_color(theme::rose_text())
+                                .child(format!(
+                                    "Why your pick ({}) didn't fit: {}",
+                                    ans.selected_choice_id, why
                                 )),
                         )
                     })
+                })
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .text_sm()
+                        .line_height(px(21.0))
+                        .text_color(theme::text_primary())
+                        .child(ans.explanation.clone()),
+                );
+
+            if !ans.mesh_effects.is_empty() {
+                let mut effects_box = div()
+                    .w_full()
+                    .min_w_0()
+                    .p_3()
+                    .rounded_md()
+                    .bg(theme::bg_input())
+                    .border_1()
+                    .border_color(theme::border_subtle())
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::accent_text())
+                            .child("Cognitive Mesh Updates"),
+                    );
+                for eff in &ans.mesh_effects {
+                    effects_box = effects_box.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(theme::text_secondary())
+                            .child(format!("• {eff}")),
+                    );
+                }
+                fb = fb.child(effects_box);
+            }
+
+            fb = fb.child(
+                div()
+                    .mt_1()
+                    .flex()
+                    .justify_end()
+                    .child(
+                        div()
+                            .id("btn-next-question")
+                            .px_5()
+                            .py_2()
+                            .rounded_md()
+                            .bg(theme::accent())
+                            .hover(|s| s.bg(theme::accent_hover()))
+                            .cursor_pointer()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::pure_white())
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.load_next_question(cx);
+                            }))
+                            .child("Next Question (Enter)"),
+                    ),
+            );
+
+            container = container.child(fb);
+        }
+
+        // Ask-a-Clarifying-Question bar (always available at the bottom of the Quiz Arena)
+        let mut clarify_card = div()
+            .w_full()
+            .min_w_0()
+            .p_5()
+            .rounded_xl()
+            .bg(theme::bg_card())
+            .border_1()
+            .border_color(theme::border_subtle())
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
                     .child(
                         div()
                             .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme::text_primary())
-                            .child(ans.explanation.clone()),
+                            .child("Unsure about a term or concept? Ask the tutor"),
                     )
                     .child(
                         div()
-                            .mt_1()
-                            .flex()
-                            .justify_end()
-                            .child(
-                                div()
-                                    .id("btn-next-question")
-                                    .px_5()
-                                    .py_2()
-                                    .rounded_md()
-                                    .bg(theme::accent())
-                                    .hover(|s| s.bg(theme::accent_hover()))
-                                    .cursor_pointer()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(gpui::white())
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                        this.load_next_question(cx);
-                                    }))
-                                    .child("Next Question (Enter)"),
-                            ),
+                            .text_xs()
+                            .text_color(theme::text_muted())
+                            .child("Answers without spoiling the quiz—and adds any missing prerequisite to your Cognitive Mesh for future practice."),
                     ),
+            );
+
+        for reply in &self.clarify_replies {
+            clarify_card = clarify_card.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .p_3p5()
+                    .rounded_lg()
+                    .bg(theme::bg_input())
+                    .border_1()
+                    .border_color(theme::border_subtle())
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::accent_text())
+                            .child(format!("You asked: {}", reply.question_asked)),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .text_sm()
+                            .line_height(px(20.0))
+                            .text_color(theme::text_primary())
+                            .child(reply.answer.clone()),
+                    )
+                    .when_some(reply.mesh_note.clone(), |el, note| {
+                        el.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .mt_1()
+                                .px_2p5()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(theme::emerald_soft())
+                                .text_xs()
+                                .text_color(theme::emerald_text())
+                                .child(format!("+ {note}")),
+                        )
+                    }),
             );
         }
 
-        container
+        if self.clarify_busy {
+            clarify_card = clarify_card.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(theme::accent_text())
+                    .child("Asking tutor & updating your Cognitive Mesh..."),
+            );
+        }
+
+        clarify_card = clarify_card.child(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .items_end()
+                .gap_2()
+                .child(div().flex_1().min_w_0().child(self.render_input_box(
+                    "input-quiz-clarify",
+                    "Ask a clarifying question",
+                    &self.clarify_input,
+                    "e.g. What is a motif? Why does microtiming matter?",
+                    false,
+                    ActiveField::QuizClarify,
+                    cx,
+                )))
+                .child(
+                    div()
+                        .id("btn-ask-clarify")
+                        .flex_shrink_0()
+                        .h(px(40.0))
+                        .px_4()
+                        .rounded_md()
+                        .bg(theme::accent())
+                        .hover(|s| s.bg(theme::accent_hover()))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme::pure_white())
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.submit_clarifying_question(cx);
+                        }))
+                        .child("Ask Tutor"),
+                ),
+        );
+
+        container.child(clarify_card)
     }
 
-    // ---------- Screen 4: Visual Knowledge Map ----------
+    // ---------- Screen 4: Cognitive Mesh Knowledge Map ----------
 
     fn render_knowledge_map(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut container = div()
             .id("map-scroll")
             .size_full()
-            .overflow_scroll()
+            .min_w_0()
+            .overflow_y_scroll()
             .p_8()
             .flex()
             .flex_col()
@@ -1919,6 +2349,7 @@ impl LearnApp {
             container = container.child(
                 div()
                     .w_full()
+                    .min_w_0()
                     .px_4()
                     .py_3()
                     .rounded_md()
@@ -1936,13 +2367,14 @@ impl LearnApp {
                 div()
                     .text_sm()
                     .text_color(theme::text_secondary())
-                    .child("Open a topic from the Dashboard to inspect its Knowledge Map."),
+                    .child("Open a topic from the Dashboard to inspect its Cognitive Mesh."),
             );
         };
 
         let stat_card = |label: &'static str, count: usize, color: gpui::Rgba| {
             div()
                 .flex_1()
+                .min_w(px(105.0))
                 .p_3()
                 .rounded_lg()
                 .bg(theme::bg_card())
@@ -1961,39 +2393,54 @@ impl LearnApp {
                 )
         };
 
+        let req_count = map.edges.iter().filter(|e| e.kind == EdgeKind::Requires).count();
+        let conf_count = map.edges.iter().filter(|e| e.kind == EdgeKind::Confuses).count();
+
         container = container
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
+                    .gap_3()
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .flex()
                             .flex_col()
                             .gap_1()
                             .child(
                                 div()
+                                    .w_full()
+                                    .min_w_0()
                                     .text_xl()
                                     .font_weight(gpui::FontWeight::BOLD)
                                     .text_color(theme::text_primary())
-                                    .child(format!("Knowledge Map · {}", map.topic.title)),
+                                    .child(format!("Cognitive Mesh · {}", map.topic.title)),
                             )
                             .child(
                                 div()
+                                    .w_full()
+                                    .min_w_0()
                                     .text_xs()
                                     .text_color(theme::text_secondary())
                                     .child(format!(
-                                        "{} compressed concepts · {}% average mastery · {} attempts",
+                                        "{} concepts · {} prerequisite edges · {} confusion links · {} shadow hypotheses",
                                         map.concepts.len(),
-                                        (map.topic.average_mastery * 100.0).round() as u32,
-                                        map.topic.total_attempts
+                                        req_count,
+                                        conf_count,
+                                        map.misconceptions.len()
                                     )),
                             ),
                     )
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap_2()
                             .child(
                                 div()
@@ -2024,7 +2471,7 @@ impl LearnApp {
                                     .cursor_pointer()
                                     .text_xs()
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(gpui::white())
+                                    .text_color(theme::pure_white())
                                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                         if let Some(tid) = this.active_topic_id.clone() {
                                             this.open_topic_quiz(tid, cx);
@@ -2036,7 +2483,10 @@ impl LearnApp {
             )
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
+                    .flex_wrap()
                     .gap_3()
                     .child(stat_card("Deepened", map.stats.deepened, theme::emerald_text()))
                     .child(stat_card("Mastered", map.stats.mastered, theme::emerald()))
@@ -2045,7 +2495,151 @@ impl LearnApp {
                     .child(stat_card("Unseen", map.stats.unseen, theme::text_muted())),
             );
 
-        // Group concepts by Depth 1..=4
+        // Cognitive Mesh Diagnostics Panel (Tension Seams, Shadow Hypotheses, Confuses, Cross-Topic Bridges)
+        let has_mesh_signals = !map.cognitive_slice.tension_seams.is_empty()
+            || !map.misconceptions.is_empty()
+            || !map.cognitive_slice.confusion_pairs.is_empty()
+            || !map.cognitive_slice.strong_bridges.is_empty();
+
+        if has_mesh_signals {
+            let mut diag = div()
+                .w_full()
+                .min_w_0()
+                .p_5()
+                .rounded_xl()
+                .bg(theme::bg_card())
+                .border_1()
+                .border_color(theme::border_subtle())
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme::accent_text())
+                        .child("Live Cognitive Mesh Signals (fed into ~200-token AI slice)"),
+                );
+
+            if !map.cognitive_slice.tension_seams.is_empty() {
+                let mut col = div().w_full().min_w_0().flex().flex_col().gap_1p5().child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme::amber_text())
+                        .child("High-Tension Prerequisite Seams"),
+                );
+                for seam in &map.cognitive_slice.tension_seams {
+                    col = col.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(theme::amber_soft())
+                            .text_xs()
+                            .text_color(theme::amber_text())
+                            .child(format!(
+                                "{} · tension {:.0}% ({})",
+                                seam.edge,
+                                seam.tension * 100.0,
+                                seam.note
+                            )),
+                    );
+                }
+                diag = diag.child(col);
+            }
+
+            if !map.misconceptions.is_empty() {
+                let mut col = div().w_full().min_w_0().flex().flex_col().gap_1p5().child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme::rose_text())
+                        .child("Active Shadow Misconception Hypotheses"),
+                );
+                for hyp in &map.misconceptions {
+                    col = col.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(theme::rose_soft())
+                            .text_xs()
+                            .text_color(theme::rose_text())
+                            .child(format!(
+                                "{} · posterior {:.0}% (seen {}x, refuted {}x)",
+                                hyp.label,
+                                hyp.probability * 100.0,
+                                hyp.evidence_count,
+                                hyp.refute_count
+                            )),
+                    );
+                }
+                diag = diag.child(col);
+            }
+
+            if !map.cognitive_slice.confusion_pairs.is_empty() {
+                let mut col = div().w_full().min_w_0().flex().flex_col().gap_1p5().child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme::amber_text())
+                        .child("Inhibitory Confusion Synapses (-w)"),
+                );
+                for cp in &map.cognitive_slice.confusion_pairs {
+                    col = col.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(theme::bg_input())
+                            .border_1()
+                            .border_color(theme::amber())
+                            .text_xs()
+                            .text_color(theme::text_primary())
+                            .child(format!("{} · interference {:.0}%", cp.pair, cp.weight * 100.0)),
+                    );
+                }
+                diag = diag.child(col);
+            }
+
+            if !map.cognitive_slice.strong_bridges.is_empty() {
+                let mut col = div().w_full().min_w_0().flex().flex_col().gap_1p5().child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme::emerald_text())
+                        .child("Cross-Topic Analogy Bridges (+w)"),
+                );
+                for br in &map.cognitive_slice.strong_bridges {
+                    col = col.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(theme::emerald_soft())
+                            .text_xs()
+                            .text_color(theme::emerald_text())
+                            .child(format!(
+                                "{} (μ {:.2}) → {}",
+                                br.from, br.from_mu, br.to
+                            )),
+                    );
+                }
+                diag = diag.child(col);
+            }
+
+            container = container.child(diag);
+        }
+
         for depth in 1..=4u8 {
             let tier: Vec<&ConceptNode> = map.concepts.iter().filter(|c| c.depth == depth).collect();
             if tier.is_empty() {
@@ -2058,7 +2652,7 @@ impl LearnApp {
                 _ => "Depth 4 · Mastery & Edge Cases",
             };
 
-            let mut list = div().flex().flex_col().gap_2p5();
+            let mut list = div().w_full().min_w_0().flex().flex_col().gap_2p5();
             for node in tier {
                 let (pill_bg, pill_fg, bar_fg) = match node.status {
                     ConceptStatus::Deepened | ConceptStatus::Mastered => {
@@ -2069,8 +2663,16 @@ impl LearnApp {
                     ConceptStatus::Unseen => (theme::bg_input(), theme::text_muted(), theme::border_subtle()),
                 };
 
+                let prereqs: Vec<String> = map
+                    .edges
+                    .iter()
+                    .filter(|e| e.kind == EdgeKind::Requires && e.to_slug == node.slug)
+                    .map(|e| e.from_label.clone())
+                    .collect();
+
                 let mut card = div()
                     .w_full()
+                    .min_w_0()
                     .p_4()
                     .rounded_lg()
                     .bg(theme::bg_card())
@@ -2081,14 +2683,20 @@ impl LearnApp {
                     .gap_2()
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .justify_between()
+                            .gap_2()
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap_2()
+                                    .min_w_0()
                                     .child(
                                         div()
                                             .text_sm()
@@ -2106,6 +2714,7 @@ impl LearnApp {
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap_2()
                                     .child(
@@ -2123,8 +2732,10 @@ impl LearnApp {
                                             .text_xs()
                                             .text_color(theme::text_secondary())
                                             .child(format!(
-                                                "{}% ({}/{})",
-                                                (node.mastery * 100.0).round() as u32,
+                                                "μ {:.2} ± {:.2} · S {:.1}h ({}/{})",
+                                                node.mastery,
+                                                node.uncertainty,
+                                                node.stability,
                                                 node.correct_count,
                                                 node.attempts
                                             )),
@@ -2133,10 +2744,23 @@ impl LearnApp {
                     )
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .text_xs()
+                            .line_height(px(18.0))
                             .text_color(theme::text_secondary())
                             .child(node.summary.clone()),
                     )
+                    .when(!prereqs.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(theme::text_muted())
+                                .child(format!("Requires: {}", prereqs.join(", "))),
+                        )
+                    })
                     .child(
                         div()
                             .w_full()
@@ -2156,6 +2780,8 @@ impl LearnApp {
                     card = card.child(
                         div()
                             .mt_1()
+                            .w_full()
+                            .min_w_0()
                             .px_3()
                             .py_2()
                             .rounded_md()
@@ -2163,7 +2789,7 @@ impl LearnApp {
                             .text_xs()
                             .text_color(theme::amber_text())
                             .child(format!(
-                                "Tracked misconceptions (compressed): {}",
+                                "Recent error notes: {}",
                                 node.misconceptions.join(" | ")
                             )),
                     );
@@ -2174,6 +2800,8 @@ impl LearnApp {
 
             container = container.child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .flex_col()
                     .gap_2()
@@ -2197,7 +2825,8 @@ impl LearnApp {
         let mut container = div()
             .id("settings-scroll")
             .size_full()
-            .overflow_scroll()
+            .min_w_0()
+            .overflow_y_scroll()
             .p_8()
             .flex()
             .flex_col()
@@ -2209,11 +2838,17 @@ impl LearnApp {
 
         container = container.child(
             div()
+                .w_full()
+                .min_w_0()
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .justify_between()
+                .gap_3()
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
                         .flex()
                         .flex_col()
                         .gap_1()
@@ -2234,6 +2869,7 @@ impl LearnApp {
                 .child(
                     div()
                         .id("btn-rescan")
+                        .flex_shrink_0()
                         .px_3()
                         .py_1p5()
                         .rounded_md()
@@ -2251,7 +2887,7 @@ impl LearnApp {
                 ),
         );
 
-        let mut runner_list = div().flex().flex_col().gap_2p5();
+        let mut runner_list = div().w_full().min_w_0().flex().flex_col().gap_2p5();
         for (idx, runner) in self.runners.iter().enumerate() {
             let active = user.runner == runner.kind;
             let kind = runner.kind;
@@ -2261,7 +2897,10 @@ impl LearnApp {
                     None => "Ready".to_string(),
                 }
             } else if runner.is_cli {
-                format!("Not found on PATH (`{}`)", runner.command.as_deref().unwrap_or(""))
+                format!(
+                    "Not found on PATH (`{}`)",
+                    runner.command.as_deref().unwrap_or("")
+                )
             } else {
                 "Needs API key".to_string()
             };
@@ -2270,9 +2909,14 @@ impl LearnApp {
                 div()
                     .id(("runner-row", idx))
                     .w_full()
+                    .min_w_0()
                     .p_4()
                     .rounded_lg()
-                    .bg(if active { theme::accent_soft() } else { theme::bg_card() })
+                    .bg(if active {
+                        theme::accent_soft()
+                    } else {
+                        theme::bg_card()
+                    })
                     .border_1()
                     .border_color(if active {
                         theme::accent()
@@ -2282,6 +2926,7 @@ impl LearnApp {
                     .hover(|s| s.border_color(theme::accent()))
                     .cursor_pointer()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .gap_4()
@@ -2290,6 +2935,8 @@ impl LearnApp {
                     }))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(260.0))
                             .flex()
                             .flex_col()
                             .gap_1()
@@ -2301,6 +2948,7 @@ impl LearnApp {
                                     .child(
                                         div()
                                             .size(px(8.0))
+                                            .flex_shrink_0()
                                             .rounded_full()
                                             .bg(if runner.available {
                                                 theme::emerald()
@@ -2318,6 +2966,8 @@ impl LearnApp {
                             )
                             .child(
                                 div()
+                                    .w_full()
+                                    .min_w_0()
                                     .text_xs()
                                     .text_color(theme::text_secondary())
                                     .child(runner.description.clone()),
@@ -2325,6 +2975,7 @@ impl LearnApp {
                     )
                     .child(
                         div()
+                            .flex_shrink_0()
                             .flex()
                             .flex_col()
                             .items_end()
@@ -2347,7 +2998,7 @@ impl LearnApp {
                                         .rounded_sm()
                                         .bg(theme::accent())
                                         .text_xs()
-                                        .text_color(gpui::white())
+                                        .text_color(theme::pure_white())
                                         .child("Active"),
                                 )
                             }),
@@ -2357,10 +3008,10 @@ impl LearnApp {
 
         container = container.child(runner_list);
 
-        // Optional Direct API Keys card
         container = container.child(
             div()
                 .w_full()
+                .min_w_0()
                 .p_5()
                 .rounded_xl()
                 .bg(theme::bg_card())
@@ -2409,7 +3060,7 @@ impl LearnApp {
                                 .cursor_pointer()
                                 .text_xs()
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(gpui::white())
+                                .text_color(theme::pure_white())
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                     this.save_api_keys(cx);
                                 }))
@@ -2434,10 +3085,18 @@ impl Render for LearnApp {
 
             div()
                 .size_full()
+                .overflow_hidden()
                 .flex()
                 .bg(theme::bg_canvas())
                 .child(self.render_sidebar(&user, cx))
-                .child(div().flex_1().h_full().child(main_view))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .overflow_hidden()
+                        .child(main_view),
+                )
                 .into_any_element()
         } else {
             self.render_auth(cx).into_any_element()
@@ -2446,7 +3105,14 @@ impl Render for LearnApp {
         div()
             .id("learn-root")
             .track_focus(&self.focus_handle)
+            .on_action(|_: &CloseWindow, window, _| {
+                window.remove_window();
+            })
+            .on_action(|_: &QuitApp, _, cx| {
+                cx.quit();
+            })
             .size_full()
+            .overflow_hidden()
             .bg(theme::bg_canvas())
             .text_color(theme::text_primary())
             .on_key_down(cx.listener(Self::handle_key_down))
