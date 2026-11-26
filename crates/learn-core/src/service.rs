@@ -512,7 +512,7 @@ impl LearnService {
         topic_id: &str,
         exclude_ids: &HashSet<String>,
     ) -> Result<StoredQuestion> {
-        let (topic, mut concepts, mut edges, misconceptions, anchors) = {
+        let (topic, mut concepts, mut edges, misconceptions, anchors, recent_trail) = {
             let store = self.store.lock().unwrap();
             let topic = store
                 .get_topic(topic_id, &user.id)?
@@ -521,7 +521,8 @@ impl LearnService {
             let edges = store.list_edges(topic_id)?;
             let misconceptions = store.list_misconceptions(topic_id)?;
             let anchors = store.list_cross_topic_anchors(&user.id, topic_id, 4)?;
-            (topic, concepts, edges, misconceptions, anchors)
+            let recent_trail = store.list_recent_question_trail(topic_id, 6)?;
+            (topic, concepts, edges, misconceptions, anchors, recent_trail)
         };
 
         let cfg = runner_cfg_for(user);
@@ -543,6 +544,7 @@ impl LearnService {
             &anchors,
             now_ms(),
             exclude_ids,
+            &recent_trail,
         )?;
 
         if directive.requires_new_concepts {
@@ -566,6 +568,7 @@ impl LearnService {
                             &anchors,
                             now_ms(),
                             exclude_ids,
+                            &recent_trail,
                         ) {
                             directive = next_dir;
                         }

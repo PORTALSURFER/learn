@@ -614,7 +614,7 @@ pub fn build_concept_map_prompt(
 ) -> String {
     let scope_note = if existing_titles.is_empty() {
         format!(
-            "Create 8 foundational-to-intermediate concepts (depths 1 to 3) covering the essential mental models of \"{topic_title}\" for a {} learner.",
+            "Create 8-10 concepts (depths 1 to 3) spread EVENLY across 4 DISTINCT subtopics (2-3 concepts per subtopic, with at least one depth 1-2 entry concept in every subtopic) covering the full breadth of \"{topic_title}\" for a {} learner.",
             level.as_str()
         )
     } else {

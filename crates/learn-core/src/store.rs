@@ -1041,6 +1041,33 @@ impl KnowledgeStore {
         Ok(set)
     }
 
+    /// Returns the most recent `(concept_id, subtopic)` pairs across both open buffered
+    /// and recently answered questions (newest first) so the scheduler interleaves subtopics.
+    pub fn list_recent_question_trail(
+        &self,
+        topic_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT q.concept_id, c.subtopic
+            FROM questions q
+            JOIN concepts c ON c.id = q.concept_id
+            WHERE q.topic_id = ?1
+            ORDER BY COALESCE(q.answered_at, q.created_at) DESC, q.created_at DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt.query_map(params![topic_id, limit as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn count_open_questions(&self, topic_id: &str) -> Result<usize> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM questions WHERE topic_id = ?1 AND answered_at IS NULL",

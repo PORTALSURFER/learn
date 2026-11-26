@@ -9,11 +9,36 @@ use crate::models::{
     TopicSummary,
 };
 
-/// Cognitive-Mesh-aware Learning Scheduler:
-/// 1. High-probability active shadow misconception / inhibitory `Confuses` pair / due `NeedsReview`
+fn subtopic_diversity_adjustment(subtopic: &str, recent_trail: &[(String, String)]) -> f64 {
+    let target = subtopic.trim().to_lowercase();
+    for (idx, (_, recent_sub)) in recent_trail.iter().take(4).enumerate() {
+        if recent_sub.trim().to_lowercase() == target {
+            return match idx {
+                0 => -1.10, // Immediately previous question's subtopic
+                1 => -0.55, // 2 turns ago
+                2 => -0.25, // 3 turns ago
+                _ => -0.10,
+            };
+        }
+    }
+    // Untouched in the recent trail -> strong variety boost!
+    0.70
+}
+
+fn is_recently_asked_concept(concept_id: &str, recent_trail: &[(String, String)], window: usize) -> bool {
+    recent_trail
+        .iter()
+        .take(window)
+        .any(|(cid, _)| cid == concept_id)
+}
+
+/// Cognitive-Mesh-aware Interleaved Learning Scheduler:
+/// Actively rotates across subtopics so the learner never gets tunnel vision,
+/// spacing mistake retries ~2 turns apart while balancing:
+/// 1. High-probability active shadow misconception / inhibitory `Confuses` pair / due `NeedsReview` (spaced away from last 2 turns)
 /// 2. High-tension predictive-coding seam (`tension >= 0.45`)
 /// 3. Due spaced-repetition reinforcement
-/// 4. Highest information-gain frontier concept (prerequisites met + highest epistemic uncertainty `σ`)
+/// 4. Highest information-gain + freshest-subtopic frontier concept (unseen & active learning)
 /// 5. Deepening (`dig_deeper`) & Knowledge Map expansion once current nodes are mastered
 pub fn select_next_directive(
     topic: &TopicSummary,
@@ -23,19 +48,40 @@ pub fn select_next_directive(
     cross_topic_anchors: &[CrossTopicAnchor],
     now_ms: i64,
     exclude_ids: &HashSet<String>,
+    recent_trail: &[(String, String)],
 ) -> Result<SchedulerDirective> {
     if concepts.is_empty() {
         return Err(anyhow!("Cannot schedule a question without concepts in the knowledge map."));
     }
 
-    let filtered: Vec<&ConceptNode> = concepts
+    // Prefer concepts not already sitting in the open queue AND not asked in the last 2 turns.
+    let mut non_excluded: Vec<&ConceptNode> = concepts
         .iter()
         .filter(|c| !exclude_ids.contains(&c.id))
         .collect();
-    let candidates: Vec<&ConceptNode> = if filtered.is_empty() {
-        concepts.iter().collect()
+    if non_excluded.is_empty() {
+        non_excluded = concepts.iter().collect();
+    }
+
+    let spaced: Vec<&ConceptNode> = non_excluded
+        .iter()
+        .copied()
+        .filter(|c| !is_recently_asked_concept(&c.id, recent_trail, 2))
+        .collect();
+    let candidates: Vec<&ConceptNode> = if !spaced.is_empty() {
+        spaced
     } else {
-        filtered
+        // If only 1-2 concepts exist total, avoid immediate back-to-back repeat if possible.
+        let not_last: Vec<&ConceptNode> = non_excluded
+            .iter()
+            .copied()
+            .filter(|c| !is_recently_asked_concept(&c.id, recent_trail, 1))
+            .collect();
+        if !not_last.is_empty() {
+            not_last
+        } else {
+            non_excluded
+        }
     };
 
     let by_slug: HashMap<&str, &ConceptNode> =
@@ -86,21 +132,33 @@ pub fn select_next_directive(
         },
     };
 
-    // 1A. Diagnostic probe for a high-probability active Misconception Shadow Node
-    if let Some(top_hyp) = misconceptions
-        .iter()
-        .filter(|m| m.probability >= 0.55)
-        .max_by(|a, b| a.probability.total_cmp(&b.probability))
-    {
-        if let Some(pick) = top_hyp
-            .linked_concepts
-            .iter()
-            .filter_map(|slug| by_slug.get(slug.as_str()).copied())
-            .find(|c| {
-                candidate_ids.contains(c.id.as_str())
-                    && c.next_review_at.map_or(true, |ts| ts <= now_ms)
-            })
-        {
+    // Check if there are completely untouched subtopics we haven't even explored yet;
+    // when the previous question was in a different subtopic and we've already done 2+ reviews in a row,
+    // we still let diversity guide review selection below.
+    let subtopic_is_just_asked = |sub: &str| {
+        recent_trail
+            .first()
+            .map(|(_, s)| s.eq_ignore_ascii_case(sub))
+            .unwrap_or(false)
+    };
+
+    // 1A. Diagnostic probe for a high-probability active Misconception Shadow Node (prefer fresh subtopic)
+    let mut eligible_hyps: Vec<(&MisconceptionNode, &ConceptNode, f64)> = Vec::new();
+    for hyp in misconceptions.iter().filter(|m| m.probability >= 0.55) {
+        for slug in &hyp.linked_concepts {
+            if let Some(pick) = by_slug.get(slug.as_str()).copied() {
+                if candidate_ids.contains(pick.id.as_str())
+                    && pick.next_review_at.map_or(true, |ts| ts <= now_ms)
+                {
+                    let score = hyp.probability + subtopic_diversity_adjustment(&pick.subtopic, recent_trail) * 0.5;
+                    eligible_hyps.push((hyp, pick, score));
+                }
+            }
+        }
+    }
+    eligible_hyps.sort_by(|a, b| b.2.total_cmp(&a.2));
+    if let Some((top_hyp, pick, _)) = eligible_hyps.first() {
+        if !subtopic_is_just_asked(&pick.subtopic) || candidates.iter().all(|c| subtopic_is_just_asked(&c.subtopic)) {
             return Ok(make_directive(
                 pick,
                 QuestionIntent::ReviewMistake,
@@ -117,12 +175,9 @@ pub fn select_next_directive(
         }
     }
 
-    // 1B. Contrast question for a strong inhibitory `Confuses` synapse
-    if let Some(conf) = edges
-        .iter()
-        .filter(|e| e.kind == EdgeKind::Confuses && e.weight >= 0.40)
-        .max_by(|a, b| a.weight.total_cmp(&b.weight))
-    {
+    // 1B. Contrast question for a strong inhibitory `Confuses` synapse (prefer fresh subtopic)
+    let mut eligible_confs: Vec<(&ConceptEdge, &ConceptNode, String, f64)> = Vec::new();
+    for conf in edges.iter().filter(|e| e.kind == EdgeKind::Confuses && e.weight >= 0.40) {
         let a = by_slug.get(conf.from_slug.as_str()).copied();
         let b = by_slug.get(conf.to_slug.as_str()).copied();
         let target_and_other = match (a, b) {
@@ -132,46 +187,55 @@ pub fn select_next_directive(
         };
         if let Some((pick, other_title)) = target_and_other {
             if pick.next_review_at.map_or(true, |ts| ts <= now_ms) {
-                return Ok(make_directive(
-                    pick,
-                    QuestionIntent::ReviewMistake,
-                    pick.depth,
-                    format!(
-                        "Contrast question separating '{}' from '{}' (confusion weight {:.2}).",
-                        pick.title, other_title, conf.weight
-                    ),
-                    false,
-                    Some(other_title),
-                    None,
-                ));
+                let score = conf.weight + subtopic_diversity_adjustment(&pick.subtopic, recent_trail) * 0.5;
+                eligible_confs.push((conf, pick, other_title, score));
             }
         }
     }
+    eligible_confs.sort_by(|a, b| b.3.total_cmp(&a.3));
+    if let Some((conf, pick, other_title, _)) = eligible_confs.first() {
+        if !subtopic_is_just_asked(&pick.subtopic) || candidates.iter().all(|c| subtopic_is_just_asked(&c.subtopic)) {
+            return Ok(make_directive(
+                pick,
+                QuestionIntent::ReviewMistake,
+                pick.depth,
+                format!(
+                    "Contrast question separating '{}' from '{}' (confusion weight {:.2}).",
+                    pick.title, other_title, conf.weight
+                ),
+                false,
+                Some(other_title.clone()),
+                None,
+            ));
+        }
+    }
 
-    // 1C. Due mistake reviews
-    let mut due_mistakes: Vec<&ConceptNode> = candidates
+    // 1C. Due mistake reviews — strongly prefer mistakes from a DIFFERENT subtopic than the last question
+    let mut due_mistakes: Vec<(&ConceptNode, f64)> = candidates
         .iter()
         .copied()
         .filter(|c| {
             c.status == ConceptStatus::NeedsReview
                 && c.next_review_at.map_or(true, |ts| ts <= now_ms)
         })
+        .map(|c| {
+            let score = (1.0 - c.mastery) + subtopic_diversity_adjustment(&c.subtopic, recent_trail);
+            (c, score)
+        })
         .collect();
-    due_mistakes.sort_by(|a, b| {
-        a.mastery
-            .total_cmp(&b.mastery)
-            .then_with(|| a.last_seen_at.unwrap_or(0).cmp(&b.last_seen_at.unwrap_or(0)))
-    });
-    if let Some(pick) = due_mistakes.first() {
-        return Ok(make_directive(
-            pick,
-            QuestionIntent::ReviewMistake,
-            pick.depth,
-            format!("Re-testing '{}' from a fresh angle to clear earlier mistakes.", pick.title),
-            false,
-            None,
-            None,
-        ));
+    due_mistakes.sort_by(|a, b| b.1.total_cmp(&a.1));
+    if let Some((pick, _)) = due_mistakes.first() {
+        if !subtopic_is_just_asked(&pick.subtopic) || candidates.iter().all(|c| subtopic_is_just_asked(&c.subtopic)) {
+            return Ok(make_directive(
+                pick,
+                QuestionIntent::ReviewMistake,
+                pick.depth,
+                format!("Re-testing '{}' from a fresh angle to clear earlier mistakes.", pick.title),
+                false,
+                None,
+                None,
+            ));
+        }
     }
 
     // 2. High-tension predictive-coding seam (`Requires` edge where upstream & downstream disagree)
@@ -188,7 +252,7 @@ pub fn select_next_directive(
         if let Some(pick) = by_slug
             .get(target_slug.as_str())
             .copied()
-            .filter(|c| candidate_ids.contains(c.id.as_str()))
+            .filter(|c| candidate_ids.contains(c.id.as_str()) && !subtopic_is_just_asked(&c.subtopic))
         {
             return Ok(make_directive(
                 pick,
@@ -206,16 +270,17 @@ pub fn select_next_directive(
     }
 
     // 3. Due spaced-repetition checks for mastered concepts
-    let mut due_reinforcements: Vec<&ConceptNode> = candidates
+    let mut due_reinforcements: Vec<(&ConceptNode, f64)> = candidates
         .iter()
         .copied()
         .filter(|c| {
             matches!(c.status, ConceptStatus::Mastered | ConceptStatus::Deepened)
                 && c.next_review_at.map_or(false, |ts| ts <= now_ms)
         })
+        .map(|c| (c, subtopic_diversity_adjustment(&c.subtopic, recent_trail)))
         .collect();
-    due_reinforcements.sort_by_key(|c| c.next_review_at.unwrap_or(0));
-    if let Some(pick) = due_reinforcements.first() {
+    due_reinforcements.sort_by(|a, b| b.1.total_cmp(&a.1));
+    if let Some((pick, _)) = due_reinforcements.first() {
         let depth = (pick.depth + if pick.mastery >= 0.90 { 1 } else { 0 }).min(4);
         return Ok(make_directive(
             pick,
@@ -228,47 +293,42 @@ pub fn select_next_directive(
         ));
     }
 
-    // 4. Information-gain frontier: prefer concepts whose prerequisites are satisfied & σ is highest!
-    let in_progress_count = candidates
-        .iter()
-        .filter(|c| c.status == ConceptStatus::Learning)
-        .count();
-
+    // 4. Interleaved Information-Gain Frontier:
+    // Strongly favors UNSEEN & active concepts in FRESH / least-recently-visited subtopics!
     let mut frontier: Vec<(f64, &ConceptNode)> = candidates
         .iter()
         .copied()
-        .filter(|c| matches!(c.status, ConceptStatus::Unseen | ConceptStatus::Learning))
+        .filter(|c| matches!(c.status, ConceptStatus::Unseen | ConceptStatus::Learning | ConceptStatus::NeedsReview))
         .map(|c| {
             let prereqs_met = edges
                 .iter()
                 .filter(|e| e.kind == EdgeKind::Requires && e.to_slug == c.slug)
                 .filter_map(|e| by_slug.get(e.from_slug.as_str()).copied())
-                .all(|p| p.mastery >= 0.62 || p.attempts == 0);
-            let mut score = c.uncertainty * 1.5 - (c.depth as f64) * 0.15;
-            if prereqs_met {
-                score += 0.60;
-            }
-            if c.status == ConceptStatus::Unseen && in_progress_count >= 3 {
-                score -= 0.45;
-            }
+                .all(|p| p.mastery >= 0.55 || p.attempts == 0);
+
+            let diversity = subtopic_diversity_adjustment(&c.subtopic, recent_trail);
+            let unseen_bonus = if c.status == ConceptStatus::Unseen { 0.35 } else { 0.0 };
+            let prereq_bonus = if prereqs_met { 0.35 } else { -0.20 };
+            let depth_nudge = -(c.depth as f64) * 0.05;
+            let score = c.uncertainty * 1.35 + diversity + unseen_bonus + prereq_bonus + depth_nudge;
             (score, c)
         })
         .collect();
     frontier.sort_by(|a, b| b.0.total_cmp(&a.0));
 
     if let Some((_, pick)) = frontier.first() {
-        let intent = if pick.status == ConceptStatus::Unseen {
-            QuestionIntent::Introduce
-        } else {
-            QuestionIntent::Reinforce
+        let intent = match pick.status {
+            ConceptStatus::Unseen => QuestionIntent::Introduce,
+            ConceptStatus::NeedsReview => QuestionIntent::ReviewMistake,
+            _ => QuestionIntent::Reinforce,
         };
         return Ok(make_directive(
             pick,
             intent,
             pick.depth,
             format!(
-                "Frontier probe on '{}' (μ={:.2}, σ={:.2}) for maximum information gain.",
-                pick.title, pick.mastery, pick.uncertainty
+                "Interleaved probe on '{}' in '{}' (μ={:.2}, σ={:.2}).",
+                pick.title, pick.subtopic, pick.mastery, pick.uncertainty
             ),
             false,
             None,
@@ -276,33 +336,16 @@ pub fn select_next_directive(
         ));
     }
 
-    // Fallback to mistakes still in brief cooldown
-    let mut pending_mistakes: Vec<&ConceptNode> = candidates
-        .iter()
-        .copied()
-        .filter(|c| c.status == ConceptStatus::NeedsReview)
-        .collect();
-    pending_mistakes.sort_by_key(|c| c.last_seen_at.unwrap_or(0));
-    if let Some(pick) = pending_mistakes.first() {
-        return Ok(make_directive(
-            pick,
-            QuestionIntent::ReviewMistake,
-            pick.depth,
-            format!("Revisiting '{}' from a new angle to lock it in.", pick.title),
-            false,
-            None,
-            None,
-        ));
-    }
-
     // 5. Everything mastered -> dig deeper and expand map if room remains
-    let mut sorted = candidates;
-    sorted.sort_by(|a, b| {
-        b.uncertainty
-            .total_cmp(&a.uncertainty)
-            .then_with(|| a.mastery.total_cmp(&b.mastery))
-    });
-    let pick = sorted[0];
+    let mut sorted: Vec<(&ConceptNode, f64)> = candidates
+        .into_iter()
+        .map(|c| {
+            let score = c.uncertainty + subtopic_diversity_adjustment(&c.subtopic, recent_trail) - c.mastery * 0.3;
+            (c, score)
+        })
+        .collect();
+    sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let pick = sorted[0].0;
     let all_mastered = concepts
         .iter()
         .all(|c| matches!(c.status, ConceptStatus::Mastered | ConceptStatus::Deepened));
@@ -346,9 +389,9 @@ mod tests {
         TopicSummary {
             id: "t1".into(),
             user_id: "u1".into(),
-            title: "Distributed Systems".into(),
+            title: "Hypnotic Techno Production".into(),
             level: SkillLevel::Intermediate,
-            concept_count: 2,
+            concept_count: 3,
             mastered_count: 0,
             average_mastery: 0.0,
             total_attempts: 0,
@@ -360,15 +403,15 @@ mod tests {
         }
     }
 
-    fn sample_concept(id: &str, slug: &str, title: &str, status: ConceptStatus) -> ConceptNode {
+    fn sample_concept(id: &str, slug: &str, title: &str, subtopic: &str, depth: u8, status: ConceptStatus) -> ConceptNode {
         ConceptNode {
             id: id.into(),
             topic_id: "t1".into(),
             slug: slug.into(),
             title: title.into(),
-            subtopic: "Core".into(),
+            subtopic: subtopic.into(),
             summary: "Summary".into(),
-            depth: 1,
+            depth,
             mastery: 0.50,
             uncertainty: 0.90,
             stability: 0.0,
@@ -392,8 +435,8 @@ mod tests {
         let now = 1_000_000;
         let empty = HashSet::new();
 
-        let c1 = sample_concept("c1", "fn-once", "FnOnce", ConceptStatus::Learning);
-        let c2 = sample_concept("c2", "fn-mut", "FnMut", ConceptStatus::Unseen);
+        let c1 = sample_concept("c1", "fn-once", "FnOnce", "Closures", 1, ConceptStatus::Learning);
+        let c2 = sample_concept("c2", "fn-mut", "FnMut", "Closures", 1, ConceptStatus::Unseen);
 
         let hyp = MisconceptionNode {
             id: "h1".into(),
@@ -407,7 +450,7 @@ mod tests {
             updated_at: now - 1000,
         };
 
-        let d1 = select_next_directive(&topic, &[c1.clone(), c2.clone()], &[], &[hyp], &[], now, &empty).unwrap();
+        let d1 = select_next_directive(&topic, &[c1.clone(), c2.clone()], &[], &[hyp], &[], now, &empty, &[]).unwrap();
         assert_eq!(d1.intent, QuestionIntent::ReviewMistake);
         assert_eq!(d1.compressed_context.target_hypothesis.as_deref(), Some("Closures spawn threads"));
 
@@ -423,8 +466,35 @@ mod tests {
             tension: 0.0,
             note: "Mixed up".into(),
         };
-        let d2 = select_next_directive(&topic, &[c1, c2], &[conf], &[], &[], now, &empty).unwrap();
+        let d2 = select_next_directive(&topic, &[c1, c2], &[conf], &[], &[], now, &empty, &[]).unwrap();
         assert_eq!(d2.intent, QuestionIntent::ReviewMistake);
         assert!(d2.compressed_context.contrast_concept.is_some());
+    }
+
+    #[test]
+    fn rotates_across_subtopics_to_prevent_tunnel_vision() {
+        let topic = sample_topic();
+        let now = 1_000_000;
+        let empty = HashSet::new();
+
+        let r1 = sample_concept("r1", "pulse", "Pulse", "Rhythm and groove", 1, ConceptStatus::Learning);
+        let r2 = sample_concept("r2", "microtiming", "Microtiming", "Rhythm and groove", 1, ConceptStatus::Unseen);
+        let s1 = sample_concept("s1", "kick-bass", "Kick & Bass Envelopes", "Sound and space", 2, ConceptStatus::Unseen);
+        let p1 = sample_concept("p1", "tension", "Long-Form Tension", "Pattern and form", 3, ConceptStatus::Unseen);
+
+        // Last question was in "Rhythm and groove" -> must jump to a different subtopic!
+        let trail = vec![("r1".into(), "Rhythm and groove".into())];
+        let d1 = select_next_directive(&topic, &[r1.clone(), r2.clone(), s1.clone(), p1.clone()], &[], &[], &[], now, &empty, &trail).unwrap();
+        assert_ne!(d1.concept.subtopic, "Rhythm and groove");
+        assert_eq!(d1.concept.id, "s1");
+
+        // Now both Rhythm and Sound were seen -> jumps to "Pattern and form"!
+        let trail2 = vec![
+            ("s1".into(), "Sound and space".into()),
+            ("r1".into(), "Rhythm and groove".into()),
+        ];
+        let d2 = select_next_directive(&topic, &[r1, r2, s1, p1], &[], &[], &[], now, &empty, &trail2).unwrap();
+        assert_eq!(d2.concept.subtopic, "Pattern and form");
+        assert_eq!(d2.concept.id, "p1");
     }
 }
