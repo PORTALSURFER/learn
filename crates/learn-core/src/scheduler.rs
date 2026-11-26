@@ -523,7 +523,7 @@ mod tests {
         TopicSummary {
             id: "t1".into(),
             user_id: "u1".into(),
-            title: "Hypnotic Techno Production".into(),
+            title: "Multidisciplinary Craft".into(),
             level: SkillLevel::Intermediate,
             concept_count: 3,
             mastered_count: 0,
@@ -611,29 +611,25 @@ mod tests {
         let now = 1_000_000;
         let empty = HashSet::new();
 
-        let r1 = sample_concept("r1", "pulse", "Pulse", "Rhythm and groove", 1, ConceptStatus::Learning);
-        let r2 = sample_concept("r2", "microtiming", "Microtiming", "Rhythm and groove", 1, ConceptStatus::Unseen);
-        let s1 = sample_concept("s1", "kick-bass", "Kick & Bass Envelopes", "Sound and space", 2, ConceptStatus::Unseen);
-        let p1 = sample_concept("p1", "tension", "Long-Form Tension", "Pattern and form", 3, ConceptStatus::Unseen);
+        let p1a = sample_concept("a1", "p1-a", "Concept A1", "Pillar A", 1, ConceptStatus::Learning);
+        let p1b = sample_concept("a2", "p1-b", "Concept A2", "Pillar A", 1, ConceptStatus::Unseen);
+        let p2 = sample_concept("b1", "p2-a", "Concept B1", "Pillar B", 2, ConceptStatus::Unseen);
+        let p3 = sample_concept("c1", "p3-a", "Concept C1", "Pillar C", 3, ConceptStatus::Unseen);
 
-        // Last question was in "Rhythm and groove" -> must jump to a different subtopic!
-        let trail = vec![(
-            "r1".into(),
-            "Rhythm and groove".into(),
-            QuestionIntent::Introduce,
-        )];
-        let d1 = select_next_directive(&topic, &[r1.clone(), r2.clone(), s1.clone(), p1.clone()], &[], &[], &[], now, &empty, &trail).unwrap();
-        assert_ne!(d1.concept.subtopic, "Rhythm and groove");
-        assert_eq!(d1.concept.id, "s1");
+        // Last question was in "Pillar A" -> must jump to a different pillar!
+        let trail = vec![("a1".into(), "Pillar A".into(), QuestionIntent::Introduce)];
+        let d1 = select_next_directive(&topic, &[p1a.clone(), p1b.clone(), p2.clone(), p3.clone()], &[], &[], &[], now, &empty, &trail).unwrap();
+        assert_ne!(d1.concept.subtopic, "Pillar A");
+        assert_eq!(d1.concept.id, "b1");
 
-        // Now both Rhythm and Sound were seen -> jumps to "Pattern and form"!
+        // Now both Pillar A and Pillar B were seen -> jumps to "Pillar C"!
         let trail2 = vec![
-            ("s1".into(), "Sound and space".into(), QuestionIntent::Introduce),
-            ("r1".into(), "Rhythm and groove".into(), QuestionIntent::Introduce),
+            ("b1".into(), "Pillar B".into(), QuestionIntent::Introduce),
+            ("a1".into(), "Pillar A".into(), QuestionIntent::Introduce),
         ];
-        let d2 = select_next_directive(&topic, &[r1, r2, s1, p1], &[], &[], &[], now, &empty, &trail2).unwrap();
-        assert_eq!(d2.concept.subtopic, "Pattern and form");
-        assert_eq!(d2.concept.id, "p1");
+        let d2 = select_next_directive(&topic, &[p1a, p1b, p2, p3], &[], &[], &[], now, &empty, &trail2).unwrap();
+        assert_eq!(d2.concept.subtopic, "Pillar C");
+        assert_eq!(d2.concept.id, "c1");
     }
 
     #[test]
@@ -643,35 +639,31 @@ mod tests {
         let now = 1_000_000;
         let empty = HashSet::new();
 
-        let mut r1 = sample_concept("r1", "cycle", "Interlocking Cycle Lengths", "Rhythm & Groove", 2, ConceptStatus::NeedsReview);
-        r1.attempts = 4;
-        r1.mastery = 0.15;
-        let mut r2 = sample_concept("r2", "accent", "Accent & Microtiming", "Rhythm & Groove", 1, ConceptStatus::Learning);
-        r2.attempts = 4;
-        let m1 = sample_concept("m1", "eq-carving", "Low-End EQ Carving", "Mixing & Low-End", 1, ConceptStatus::Unseen);
-        let sd1 = sample_concept("sd1", "fm-timbre", "FM & Filter Modulation", "Sound Design & Synthesis", 1, ConceptStatus::Unseen);
+        let mut a1 = sample_concept("a1", "a-1", "Concept A1", "Pillar A", 2, ConceptStatus::NeedsReview);
+        a1.attempts = 4;
+        a1.mastery = 0.15;
+        let mut a2 = sample_concept("a2", "a-2", "Concept A2", "Pillar A", 1, ConceptStatus::Learning);
+        a2.attempts = 4;
+        let b1 = sample_concept("b1", "b-1", "Concept B1", "Pillar B", 1, ConceptStatus::Unseen);
+        let c1 = sample_concept("c1", "c-1", "Concept C1", "Pillar C", 1, ConceptStatus::Unseen);
 
         let hyp = MisconceptionNode {
             id: "h1".into(),
             topic_id: "t1".into(),
-            slug: "accent-restarts".into(),
-            label: "accent_count_restarts_each_bar".into(),
+            slug: "sample-misconception".into(),
+            label: "sample_misconception".into(),
             probability: 0.77,
             evidence_count: 2,
             refute_count: 0,
-            linked_concepts: vec!["cycle".into()],
+            linked_concepts: vec!["a-1".into()],
             updated_at: now - 1000,
         };
 
-        // Immediately after a ReviewMistake, scheduler must pivot to an unexplored pillar (Mixing or Sound Design)
-        let trail = vec![(
-            "r2".into(),
-            "Rhythm & Groove".into(),
-            QuestionIntent::ReviewMistake,
-        )];
+        // Immediately after a ReviewMistake, scheduler must pivot to an unexplored pillar (B or C)
+        let trail = vec![("a2".into(), "Pillar A".into(), QuestionIntent::ReviewMistake)];
         let d = select_next_directive(
             &topic,
-            &[r1, r2, m1, sd1],
+            &[a1, a2, b1, c1],
             &[],
             &[hyp],
             &[],
@@ -682,9 +674,8 @@ mod tests {
         .unwrap();
         assert_eq!(d.intent, QuestionIntent::Introduce);
         assert!(
-            d.concept.subtopic == "Mixing & Low-End"
-                || d.concept.subtopic == "Sound Design & Synthesis",
-            "expected unexplored non-rhythm pillar, got {}",
+            d.concept.subtopic == "Pillar B" || d.concept.subtopic == "Pillar C",
+            "expected unexplored pillar, got {}",
             d.concept.subtopic
         );
         // Narrow 4-concept / 3-pillar map after 8 attempts must request automatic broadening

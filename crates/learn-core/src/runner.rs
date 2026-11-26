@@ -760,8 +760,10 @@ pub fn build_concept_map_prompt(
 ) -> String {
     let scope_note = if existing_titles.is_empty() {
         format!(
-            "Create 12-16 concepts (depths 1 to 3) spread EVENLY across 5-6 DISTINCT major pillars/disciplines of \"{topic_title}\" (2-3 concepts per pillar, with at least one depth 1-2 entry concept in EVERY pillar) for a {} learner.\n\
-             CRITICAL BREADTH RULE: Cover the FULL multidisciplinary scope of \"{topic_title}\" — NEVER cluster into just one narrow facet! For example, a music production topic MUST span distinct pillars such as Sound Design & Synthesis, Mixing & EQ/Dynamics, Low-End & Kick/Bass Engineering, Rhythm & Groove, Space/FX & Atmospheres, and Arrangement & Club Energy (adapt the 5-6 pillars naturally to whatever domain \"{topic_title}\" is).",
+            "Design a complete, well-rounded study program for \"{topic_title}\" at the {} level.\n\
+             Step 1 (Mentally decompose the field): Ask yourself what 5-6 DISTINCT major pillars/disciplines a real-world practitioner of \"{topic_title}\" must combine to become genuinely competent—covering the full breadth of the subject (fundamental principles, hands-on craft/creation, technical execution & tools, refinement/critique/troubleshooting, larger-scale structure/composition, and real-world application/context—adapted naturally to \"{topic_title}\").\n\
+             Step 2 (Populate the map): Create 12-16 concrete concepts (depths 1 to 3) spread EVENLY across all 5-6 pillars (2-3 concepts per pillar, with at least one depth 1-2 entry concept in EVERY pillar).\n\
+             CRITICAL BREADTH RULE: Never let one narrow sub-skill dominate the study program. Every major facet of \"{topic_title}\" must be represented from day one.",
             level.as_str()
         )
     } else {
@@ -771,21 +773,23 @@ pub fn build_concept_map_prompt(
             existing_subtopics.join(", ")
         };
         format!(
-            "Existing subtopics/pillars in the map: {subtopic_list}.\n\
+            "Audit and expand this study program for \"{topic_title}\" ({} level).\n\
+             Current pillars in the map: {subtopic_list}.\n\
              Already covered concepts (DO NOT repeat these): {}.\n\
              Generate 6-10 NEW concepts.\n\
-             CRITICAL BREADTH-FIRST AUDIT: First identify major pillars/disciplines of \"{topic_title}\" that are MISSING or underrepresented above (for example, in music production: Sound Design & Synthesis, Mixing & EQ, Compression & Dynamics, Reverb/Rumble/FX & Spatial Depth, Arrangement & Transitions, Mastering/Club Translation — tailored to \"{topic_title}\"). Create depth 1-2 entry concepts in those missing pillars first! Only add depth {min_depth}-4 deeper concepts when all major pillars of \"{topic_title}\" are already well covered.",
+             CRITICAL CURRICULUM AUDIT: Ask yourself—if a learner ONLY mastered the concepts listed above, which major disciplines, practical skills, or essential pillars of \"{topic_title}\" would they still be completely blind to? Fill those missing or underrepresented pillars FIRST with depth 1-2 entry concepts! Only add depth {min_depth}-4 deeper extensions to existing pillars once the study program spans the full breadth of \"{topic_title}\".",
+            level.as_str(),
             existing_titles.join(", ")
         )
     };
 
     format!(
-        "You are an expert adaptive tutor building a multidisciplinary Cognitive Mesh Knowledge Map for \"{topic_title}\".\n\
+        "You are an expert curriculum architect designing a multidisciplinary Cognitive Mesh study program for \"{topic_title}\".\n\
          {scope_note}\n\
          For depth 2-4 concepts, include 1-2 prerequisite concept titles in `requires` (empty array [] for depth 1).\n\
          Return ONLY a valid JSON object matching:\n\
          {{\"concepts\":[{{\"title\":\"...\",\"subtopic\":\"...\",\"summary\":\"1-sentence core mental model\",\"depth\":1,\"requires\":[]}}]}}\n\
-         Keep titles concise (2-5 words), use 5-6 clean, distinct pillar names in `subtopic`, and make every summary crisp and accurate."
+         Keep titles concise (2-5 words), use 5-6 clean, distinct pillar names in `subtopic`, and make every summary crisp, practical, and accurate."
     )
 }
 
@@ -858,27 +862,27 @@ pub fn build_question_prompt(directive: &SchedulerDirective) -> String {
 
     lines.push("Pedagogical & Anti-Confusion Rules (CRITICAL):".into());
     lines.push(format!(
-        "- DISCIPLINE FIDELITY (CRITICAL): Stay 100% faithful to the target concept's actual pillar (`{}`) and subject matter. NEVER twist a sound design, synthesis, mixing, EQ, compression, saturation, reverb/space, arrangement, or theory concept into a step-sequencer accent or rim-click timing puzzle!",
+        "- DISCIPLINE FIDELITY (CRITICAL): Stay 100% faithful to the target concept's actual pillar (`{}`) and subject matter. NEVER distort the concept into an unrelated sub-skill or force it into a narrow template just to reuse a media format.",
         directive.concept.subtopic
     ));
     lines.push("- Write in crystal-clear, concrete, everyday language matched to the learner's level. Briefly define any domain jargon inline.".into());
-    lines.push("- `goal`: 1 crisp plain-English sentence explaining the HUMAN, EMOTIONAL, PERCEPTUAL, or PRACTICAL WHY first—why a real practitioner wants this effect in the first place.".into());
+    lines.push("- `goal`: 1 crisp plain-English sentence explaining the HUMAN, PERCEPTUAL, or PRACTICAL WHY first—why a real practitioner cares about this concept in the first place.".into());
     if needs_primer {
-        lines.push("- `primer`: REQUIRED here (learner is new to or struggling with this concept). Write 1-2 short, intuitive sentences TEACHING the core mental model BEFORE the question (e.g. 'High-pass filtering clears mud by cutting low frequencies from non-bass elements so the kick and sub have room.'). Teach the principle cleanly WITHOUT spoiling the exact answer letter.".into());
+        lines.push("- `primer`: REQUIRED here (learner is new to or struggling with this concept). Write 1-2 short, intuitive sentences TEACHING the core mental model and cause-and-effect principle BEFORE the question, without spoiling the exact answer letter.".into());
     } else {
         lines.push("- `primer`: Return empty string \"\" since the learner already has solid mastery and should recall unassisted.".into());
     }
-    lines.push("- `prompt`: Keep it effortless to grok on the FIRST read! State ONE clean starting setup + ONE clear question. NEVER include decoy backstories (like 'you try a second loop') that confuse what the learner is editing.".into());
-    lines.push("- EXPLICIT CONSTRAINT RULE (zero ambiguity): Every single constraint used to reject ANY distractor (e.g., 'without changing the melody', 'using EQ only', 'keeping the kick transient intact') MUST be stated explicitly inside `prompt`. Never penalize an option for breaking an unmentioned constraint!".into());
+    lines.push("- `prompt`: Keep it effortless to grok on the FIRST read! State ONE clean starting setup + ONE clear question. NEVER include decoy backstories that confuse what the learner is deciding or modifying.".into());
+    lines.push("- EXPLICIT CONSTRAINT RULE (zero ambiguity): Every single constraint used to reject ANY distractor MUST be stated explicitly inside `prompt`. Never penalize an option for breaking an unmentioned constraint!".into());
     lines.push("- CHOICES: Keep each of the 4 choices SHORT (<= 14 words), concrete, and parallel in structure, varying ONE clear dimension at a time. Exactly 1 unambiguously right answer and 3 clearly distinct distractors (never 'All of the above').".into());
     lines.push("- `hint`: 1 crisp sentence nudging the learner toward the mental model WITHOUT revealing the correct choice.".into());
-    lines.push("- `media`: ACTIVELY include the BEST supporting example (`reveal: \"before_answer\"` by default!) matched to THIS concept's discipline—without spoiling which option A-D is correct:".into());
-    lines.push("  * `audio`: Great for sonic concepts! Match `voice` to the discipline: `synth` (synthesis, timbre, filter cutoff/modulation), `kick_bass` (low-end balance, sidechain/ducking, sub clarity), `reverb_rumble` (dark club space, reverb tails, techno rumble), `saturation` (harmonics, overdrive, analog warmth/grit), `delay` (echo/dub space), and `rim_click` ONLY when the concept is genuinely about percussion/timing/accents. Put the ORIGINAL starting sound in `values` + `labels`, and TARGET in `afterValues`. Populate `correctAudioEffect` AND every distractor's `audioEffect` (`stepLevels`, `cutoffStartHz`/`cutoffEndHz`, `accentStep`, `nudgeMs`, `gainScale`, `pitchShiftSemis`, `wetEffect`: 'default'|'dry'|'wet') so picking ANY option A-D auditions what that edit sounds like! For non-audio questions, leave `audioEffect` fields empty/0/'default'.".into());
-    lines.push("  * `curve`: 4-16 normalized values (0.0..1.0 with clear visual contrast) + concise labels — ideal for EQ frequency curves, ADSR envelopes, filter sweeps, compression gain reduction, arrangement energy arcs, or math plots.".into());
-    lines.push("  * `flow`: 2-5 connected `flowSteps` (`label`, `note`) — ideal for mixing/synthesis signal chains (e.g. Osc -> Filter -> Saturation -> Send Reverb), routing buses, protocols, or causal pipelines.".into());
-    lines.push("  * `contrast`: side-by-side comparison (`leftTitle`/`leftPoints` vs `rightTitle`/`rightPoints`) — ideal for mixing/sound-design trade-offs (e.g. Insert vs Send FX, Mono Sub vs Wide Highs, Subtractive vs FM).".into());
-    lines.push("  * `interactive_html`: a compact self-contained offline HTML/SVG/Canvas/WebAudio interactive toy (dark `#040405`, white `#F4F4F6`, red `#E11D2E`, zero external CDNs) when a live interactive sandbox makes the concept click instantly.".into());
-    lines.push("  * `none`: Use ONLY when a visual/audio/interactive example truly adds zero clarity.".into());
+    lines.push("- `media`: Choose whichever supporting example modality (`reveal: \"before_answer\"` by default) genuinely makes THIS specific concept clearest—without spoiling which option A-D is right:".into());
+    lines.push("  * `curve`: 4-16 normalized values (0.0..1.0 with clear visual contrast) + concise labels — ideal for profiles, curves, envelopes, distributions, responses, or sequential intensities.".into());
+    lines.push("  * `flow`: 2-5 connected `flowSteps` (`label`, `note`) — ideal for chains, pipelines, lifecycles, architectures, or cause-and-effect sequences.".into());
+    lines.push("  * `contrast`: side-by-side comparison (`leftTitle`/`leftPoints` vs `rightTitle`/`rightPoints`) — ideal for trade-offs, competing approaches, or structural comparisons.".into());
+    lines.push("  * `interactive_html`: a compact self-contained offline HTML/SVG/Canvas/WebAudio interactive toy (dark `#040405`, white `#F4F4F6`, red `#E11D2E`, zero external CDNs) when hands-on manipulation makes the concept click instantly.".into());
+    lines.push("  * `audio`: use ONLY when hearing a synthesized sound genuinely illuminates the concept (available synth voices: `synth`, `rim_click`, `kick_bass`, `delay`, `reverb_rumble`, `saturation`; put starting parameters in `values` + `labels`, target in `afterValues`, and populate `correctAudioEffect` + each distractor's `audioEffect` so picking any option auditions its sonic result). For non-audio questions, leave `audioEffect` fields empty/0/'default'. Never bend a concept into an audio puzzle when `curve`, `flow`, `contrast`, or `interactive_html` fits better!".into());
+    lines.push("  * `none`: Use ONLY when no visual, audio, or interactive example adds clarity.".into());
     lines.push("- For EACH distractor, provide `trapKind` ('confuses_concept' | 'misconception' | 'careless'), `trapTarget`, and `whyWrong` (1 crisp sentence explaining what picking THAT specific option would actually feel like or cause instead of the stated goal).".into());
     lines.push("- `explanation`: 3 clear sentences bridging mechanics to real impact: (1) why you want this move emotionally/practically, (2) how the right answer achieves it, and (3) how the alternatives differ.".into());
     lines.push("- `angleSummary`: 4-8 words describing what angle this question tested.".into());
@@ -1173,12 +1177,12 @@ impl AiRunner {
              Goal: \"{goal}\"\n\
              Question: \"{question_prompt}\"\n\
              {spoiler_rule}\n\
-             Choose the SINGLE best modality (`audio`, `curve`, `flow`, `contrast`, or `interactive_html` — do NOT return `none`!) and set `reveal: \"before_answer\"`.\n\
-             - Pick `audio` for music/sound/rhythm/acoustics so our built-in Rust synth lets them hear it live.\n\
-             - Pick `curve` for 4-16 step grids, envelopes, sweeps, or math plots.\n\
-             - Pick `flow` for signal chains, protocols, or step-by-step mechanisms.\n\
-             - Pick `contrast` for comparing two setups/forces side-by-side.\n\
+             Choose the SINGLE best modality (`curve`, `flow`, `contrast`, `interactive_html`, or `audio` — do NOT return `none`!) and set `reveal: \"before_answer\"`.\n\
+             - Pick `curve` for profiles, curves, envelopes, distributions, responses, or sequential intensities.\n\
+             - Pick `flow` for chains, pipelines, lifecycles, architectures, or step-by-step mechanisms.\n\
+             - Pick `contrast` for comparing two approaches, trade-offs, or competing forces side-by-side.\n\
              - Pick `interactive_html` for a compact self-contained offline dark-mode (`#050506`, `#F4F4F6`, `#E11D2E`) HTML/SVG/Canvas/WebAudio mini-lab.\n\
+             - Pick `audio` ONLY when hearing a synthesized sound directly illuminates the concept.\n\
              Return ONLY valid JSON matching the schema.",
             level.as_str()
         );
@@ -1366,22 +1370,22 @@ fn demo_concepts(topic: &str, existing: &[String], min_depth: u8) -> Vec<Concept
         },
         ConceptInput {
             title: "Design & Shaping Craft".into(),
-            subtopic: "Design & Synthesis".into(),
-            summary: format!("How raw elements are sculpted and modulated into cohesive {t} output."),
+            subtopic: "Design & Craft".into(),
+            summary: format!("How raw building blocks are composed into cohesive {t} outcomes."),
             depth: 1,
             requires: vec![],
         },
         ConceptInput {
             title: "Balance & Clarity".into(),
-            subtopic: "Tuning & Mixing".into(),
-            summary: format!("How competing layers are separated and balanced for clean {t} results."),
+            subtopic: "Analysis & Refinement".into(),
+            summary: format!("How competing factors are balanced and refined for reliable {t} results."),
             depth: 1,
             requires: vec![],
         },
         ConceptInput {
-            title: "Depth & Spatial Context".into(),
-            subtopic: "Space & Atmosphere".into(),
-            summary: format!("How environment, layering, and subtle movement add depth in {t}."),
+            title: "Context & Environment".into(),
+            subtopic: "Systems & Context".into(),
+            summary: format!("How surrounding conditions and interactions shape {t} in practice."),
             depth: 2,
             requires: vec!["Design & Shaping Craft".into()],
         },
@@ -1401,7 +1405,7 @@ fn demo_concepts(topic: &str, existing: &[String], min_depth: u8) -> Vec<Concept
         },
         ConceptInput {
             title: "Diagnostics & Verification".into(),
-            subtopic: "Tuning & Mixing".into(),
+            subtopic: "Analysis & Refinement".into(),
             summary: format!("How to observe, measure, and debug {t} systematically."),
             depth: 2,
             requires: vec!["Balance & Clarity".into()],
