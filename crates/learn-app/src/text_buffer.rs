@@ -14,6 +14,16 @@ impl TextBuffer {
         Self::default()
     }
 
+    pub fn from_string_or_empty(text: &str) -> Self {
+        let s = text.to_string();
+        let end = s.len();
+        Self {
+            text: s,
+            cursor: end,
+            anchor: end,
+        }
+    }
+
     #[cfg(test)]
     pub fn from_string(text: String) -> Self {
         let end = text.len();

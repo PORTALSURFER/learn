@@ -219,6 +219,11 @@ impl KnowledgeStore {
                 is_correct INTEGER
             );
 
+            CREATE TABLE IF NOT EXISTS app_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_topics_user ON topics(user_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_concepts_topic ON concepts(topic_id, depth, mastery);
             CREATE INDEX IF NOT EXISTS idx_edges_topic ON concept_edges(topic_id, kind, tension);
@@ -333,6 +338,42 @@ impl KnowledgeStore {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn set_remembered_user_id(&self, user_id: Option<&str>) -> Result<()> {
+        match user_id {
+            Some(id) => {
+                self.conn.execute(
+                    r#"
+                    INSERT INTO app_state (key, value) VALUES ('remembered_user_id', ?1)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    "#,
+                    params![id],
+                )?;
+            }
+            None => {
+                self.conn.execute(
+                    "DELETE FROM app_state WHERE key = 'remembered_user_id'",
+                    [],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_remembered_user(&self) -> Result<Option<User>> {
+        let user_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM app_state WHERE key = 'remembered_user_id'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match user_id {
+            Some(id) => self.get_user_by_id(&id),
+            None => Ok(None),
+        }
     }
 
     pub fn get_user_by_username(&self, username: &str) -> Result<Option<User>> {

@@ -76,6 +76,21 @@ impl LearnService {
         self.store.lock().unwrap().authenticate_user(username, password)
     }
 
+    pub fn remember_user(&self, user_id: &str) -> Result<()> {
+        self.store
+            .lock()
+            .unwrap()
+            .set_remembered_user_id(Some(user_id))
+    }
+
+    pub fn clear_remembered_user(&self) -> Result<()> {
+        self.store.lock().unwrap().set_remembered_user_id(None)
+    }
+
+    pub fn restore_remembered_user(&self) -> Result<Option<User>> {
+        self.store.lock().unwrap().get_remembered_user()
+    }
+
     pub fn update_runner(
         &self,
         user_id: &str,
@@ -638,5 +653,11 @@ mod tests {
         assert_eq!(reply.added_concept_title.as_deref(), Some("qubit"));
         let map_after = svc.get_knowledge_map(&user.id, &topic.id).unwrap();
         assert!(map_after.concepts.iter().any(|c| c.slug == "qubit" && c.status == ConceptStatus::NeedsReview));
+
+        // Remembered session restores user on relaunch and clears on sign-out
+        svc.remember_user(&user.id).unwrap();
+        assert_eq!(svc.restore_remembered_user().unwrap().unwrap().id, user.id);
+        svc.clear_remembered_user().unwrap();
+        assert!(svc.restore_remembered_user().unwrap().is_none());
     }
 }

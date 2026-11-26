@@ -41,6 +41,7 @@ pub struct LearnApp {
     user: Option<User>,
     known_usernames: Vec<String>,
     is_register_mode: bool,
+    remember_me: bool,
     auth_username: TextBuffer,
     auth_password: TextBuffer,
 
@@ -91,24 +92,41 @@ impl LearnApp {
 
         let known_usernames = service.list_usernames().unwrap_or_default();
         let is_register_mode = known_usernames.is_empty();
-        let runners = service.detect_runners(None);
+        let restored_user = service.restore_remembered_user().ok().flatten();
+        let runners = service.detect_runners(restored_user.as_ref());
+        let (topics, gemini_key_input, openai_key_input, active_field) = match &restored_user {
+            Some(u) => (
+                service.list_topics(&u.id).unwrap_or_default(),
+                TextBuffer::from_string_or_empty(&u.gemini_api_key),
+                TextBuffer::from_string_or_empty(&u.openai_api_key),
+                ActiveField::NewTopic,
+            ),
+            None => (
+                Vec::new(),
+                TextBuffer::new(),
+                TextBuffer::new(),
+                ActiveField::AuthUsername,
+            ),
+        };
+        let first_topic_id = topics.first().map(|t| t.id.clone());
 
-        Self {
+        let mut app = Self {
             service,
             focus_handle,
-            user: None,
+            user: restored_user,
             known_usernames,
             is_register_mode,
+            remember_me: true,
             auth_username: TextBuffer::new(),
             auth_password: TextBuffer::new(),
             route: Route::Dashboard,
-            active_field: ActiveField::AuthUsername,
+            active_field,
             new_topic_title: TextBuffer::new(),
             new_topic_level: SkillLevel::Beginner,
-            gemini_key_input: TextBuffer::new(),
-            openai_key_input: TextBuffer::new(),
+            gemini_key_input,
+            openai_key_input,
             runners,
-            topics: Vec::new(),
+            topics,
             active_topic_id: None,
             knowledge_map: None,
             current_question: None,
@@ -126,7 +144,13 @@ impl LearnApp {
             clarify_replies: Vec::new(),
             error_banner: None,
             info_banner: None,
+        };
+
+        if let Some(tid) = first_topic_id {
+            app.start_buffer_refill_for(tid, DEFAULT_BUFFER_TARGET, cx);
         }
+
+        app
     }
 
     // ---------- Auth & Navigation Actions ----------
@@ -145,6 +169,11 @@ impl LearnApp {
 
         match res {
             Ok(user) => {
+                if self.remember_me {
+                    let _ = self.service.remember_user(&user.id);
+                } else {
+                    let _ = self.service.clear_remembered_user();
+                }
                 self.gemini_key_input.set_text(user.gemini_api_key.clone());
                 self.openai_key_input.set_text(user.openai_api_key.clone());
                 self.runners = self.service.detect_runners(Some(&user));
@@ -166,6 +195,7 @@ impl LearnApp {
     }
 
     fn sign_out(&mut self, cx: &mut Context<Self>) {
+        let _ = self.service.clear_remembered_user();
         self.user = None;
         self.topics.clear();
         self.active_topic_id = None;
@@ -1344,6 +1374,47 @@ impl LearnApp {
                 ActiveField::AuthPassword,
                 cx,
             ))
+            .child(
+                div()
+                    .id("toggle-remember-me")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.remember_me = !this.remember_me;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .rounded_xs()
+                            .bg(if self.remember_me {
+                                theme::accent()
+                            } else {
+                                theme::bg_input()
+                            })
+                            .border_1()
+                            .border_color(if self.remember_me {
+                                theme::accent()
+                            } else {
+                                theme::border_subtle()
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .text_color(theme::pure_white())
+                            .child(if self.remember_me { "✓" } else { "" }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::text_secondary())
+                            .child("Remember me on this device (auto-login on launch)"),
+                    ),
+            )
             .child(
                 div()
                     .id("btn-auth-submit")
