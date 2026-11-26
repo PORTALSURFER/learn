@@ -583,6 +583,7 @@ impl LearnService {
             concept_id: directive.concept.id,
             intent: directive.intent,
             goal: generated.goal,
+            primer: generated.primer,
             hint: generated.hint,
             media: generated.media,
             prompt: generated.prompt,

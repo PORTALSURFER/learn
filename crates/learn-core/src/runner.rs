@@ -16,6 +16,7 @@ use crate::models::{
 #[derive(Debug, Clone)]
 pub struct GeneratedQuestion {
     pub goal: String,
+    pub primer: String,
     pub hint: String,
     pub media: Option<ExampleMedia>,
     pub prompt: String,
@@ -174,9 +175,10 @@ pub fn question_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["goal", "hint", "media", "prompt", "correctAnswer", "distractors", "explanation", "angleSummary"],
+        "required": ["goal", "primer", "hint", "media", "prompt", "correctAnswer", "distractors", "explanation", "angleSummary"],
         "properties": {
             "goal": { "type": "string" },
+            "primer": { "type": "string" },
             "hint": { "type": "string" },
             "media": media_object_schema(),
             "prompt": { "type": "string" },
@@ -351,6 +353,8 @@ struct RawQuestion {
     #[serde(default)]
     goal: String,
     #[serde(default)]
+    primer: String,
+    #[serde(default)]
     hint: String,
     #[serde(default)]
     media: Option<RawMedia>,
@@ -498,6 +502,7 @@ pub fn parse_and_shuffle_question(val: Value) -> Result<GeneratedQuestion> {
 
     Ok(GeneratedQuestion {
         goal: raw.goal.trim().chars().take(280).collect(),
+        primer: raw.primer.trim().chars().take(320).collect(),
         hint: raw.hint.trim().chars().take(200).collect(),
         media,
         prompt,
@@ -708,24 +713,35 @@ pub fn build_question_prompt(directive: &SchedulerDirective) -> String {
         ));
     }
 
-    lines.push("Pedagogical & Clarity Rules:".into());
-    lines.push("- Write in clear, concrete, everyday language matched to the learner's level. Briefly define any domain jargon inline instead of assuming the learner already knows it.".into());
-    lines.push("- `goal`: 1-2 plain-English sentences explaining the HUMAN, EMOTIONAL, PERCEPTUAL, or PRACTICAL WHY first—why a real practitioner would want this effect or outcome in the first place (e.g., what feeling, tension, groove, or real-world problem it solves), not just dry mechanics.".into());
-    lines.push("- `hint`: 1 crisp sentence nudging the learner toward the mental model WITHOUT revealing or naming the correct choice.".into());
-    lines.push("- `media`: ACTIVELY include a concrete supporting example on almost every question (`reveal: \"before_answer\"` by default!) so the learner can SEE, HEAR, or FEEL the goal and setup before answering—without spoiling which option A-D is correct. Pick the SINGLE best modality for this specific topic & question (unused fields = empty string/array/0):".into());
-    lines.push("  * `audio`: STRONGLY PREFERRED for music, sound design, rhythm, groove, or acoustics! Choose `voice` ('rim_click' for beat/accent clicks, 'kick_bass' for low-end pocket/envelopes, 'delay' for rhythmic echo, or 'synth' for filter/timbre sweeps) + populate `values` (4-16 step intensities 0.0..1.0) and `labels` (e.g. ['1','2','3','4']) so our UI renders a synced VISUAL STEP GRID right above the Play buttons! Set `afterValues` for the after/target pattern when comparing, and set `reveal: \"before_answer\"` so the learner can immediately SEE & HEAR the setup before choosing.".into());
-    lines.push("  * `curve`: 4-16 normalized values (0.0..1.0) + concise labels — ideal for filter/energy curves, 16-step velocity/accent grids, math functions, growth curves, or envelopes.".into());
+    let needs_primer = directive.concept.mastery < 0.55
+        || matches!(
+            directive.concept.status,
+            crate::models::ConceptStatus::Unseen | crate::models::ConceptStatus::NeedsReview
+        );
+
+    lines.push("Pedagogical & Anti-Confusion Rules (CRITICAL):".into());
+    lines.push("- Write in crystal-clear, concrete, everyday language matched to the learner's level. Briefly define any domain jargon inline.".into());
+    lines.push("- `goal`: 1 crisp plain-English sentence explaining the HUMAN, EMOTIONAL, PERCEPTUAL, or PRACTICAL WHY first—why a real practitioner wants this effect in the first place.".into());
+    if needs_primer {
+        lines.push("- `primer`: REQUIRED here (learner is new to or struggling with this concept). Write 1-2 short, intuitive sentences TEACHING the core mental model BEFORE the question (e.g. 'An accent works by contrast—one hit pops out only when the hits around it stay softer.'). Teach the principle cleanly WITHOUT spoiling the exact answer letter.".into());
+    } else {
+        lines.push("- `primer`: Return empty string \"\" since the learner already has solid mastery and should recall unassisted.".into());
+    }
+    lines.push("- `prompt`: Keep it effortless to grok on the FIRST read! State ONE clean starting setup + ONE clear question. NEVER include decoy backstories (like 'you try a second loop') that confuse what the learner is editing.".into());
+    lines.push("- EXPLICIT CONSTRAINT RULE (zero ambiguity): Every single constraint used to reject ANY distractor (e.g., 'while keeping all timing locked on the grid', 'using loudness only', 'without changing pitch') MUST be stated explicitly inside `prompt`. Never penalize an option for breaking an unmentioned constraint!".into());
+    lines.push("- CHOICES: Keep each of the 4 choices SHORT (<= 14 words), concrete, and parallel in structure, varying ONE clear dimension at a time. Exactly 1 unambiguously right answer and 3 clearly distinct distractors (never 'All of the above').".into());
+    lines.push("- `hint`: 1 crisp sentence nudging the learner toward the mental model WITHOUT revealing the correct choice.".into());
+    lines.push("- `media`: ACTIVELY include a concrete supporting example (`reveal: \"before_answer\"` by default!) so the learner can SEE, HEAR, or FEEL the starting setup before answering—without spoiling which option A-D is correct:".into());
+    lines.push("  * `audio`: STRONGLY PREFERRED for music, sound design, rhythm, groove, or acoustics! Choose `voice` ('rim_click', 'kick_bass', 'delay', or 'synth'). Put the STARTING sound in `values` (4-16 floats with strong visual contrast, e.g. accent >= 0.90 vs regular <= 0.35) + `labels`, and put the TARGET/CORRECT sound in `afterValues`. `beforeLabel` must describe the starting loop (e.g. 'Starting Loop'), and `afterLabel` must describe the target result (e.g. 'Target Sound') — NEVER put a wrong distractor in `afterValues`!".into());
+    lines.push("  * `curve`: 4-16 normalized values (0.0..1.0 with clear visual contrast) + concise labels — ideal for filter/energy curves, step velocity grids, math functions, growth curves, or envelopes.".into());
     lines.push("  * `flow`: 2-5 connected `flowSteps` (`label`, `note`) — ideal for signal chains, protocols, lifecycles, causal steps, or pipelines.".into());
-    lines.push("  * `contrast`: side-by-side comparison (`leftTitle`/`leftPoints` vs `rightTitle`/`rightPoints`) — ideal for clarifying two competing forces or setups in the question.".into());
-    lines.push("  * `interactive_html`: a compact self-contained offline HTML/SVG/Canvas/WebAudio interactive toy (dark background `#050506`, crisp white/grey text, `#E11D2E` red accent, zero external scripts/CDNs) when a live slider/sandbox makes the concept click instantly.".into());
-    lines.push("  * `none`: Use ONLY when a visual/audio/interactive example genuinely adds zero clarity.".into());
-    lines.push("- `prompt`: Clear, unambiguous scenario and question directly tied to that felt/practical goal.".into());
-    lines.push("- Exactly 1 unambiguously correct answer and 3 plausible, similar-length distractors (never 'All of the above').".into());
-    lines.push("- For EACH distractor, provide `trapKind` ('confuses_concept' | 'misconception' | 'careless'), `trapTarget`, and `whyWrong` (1 crisp sentence explaining what picking THAT specific option would actually feel like or cause instead of the desired goal).".into());
-    lines.push("- `explanation`: 3 clear sentences bridging mechanics to real impact: (1) the emotional/perceptual/practical payoff of why you'd want this move in the first place, (2) how the right answer achieves that effect, and (3) why the alternative directions produce a different feeling or undesired outcome.".into());
-    lines.push("- If `strong_bridges` has a mastered concept from another topic, feel free to weave in a brief analogy when explaining.".into());
+    lines.push("  * `contrast`: side-by-side comparison (`leftTitle`/`leftPoints` vs `rightTitle`/`rightPoints`) — ideal for clarifying two competing forces.".into());
+    lines.push("  * `interactive_html`: a compact self-contained offline HTML/SVG/Canvas/WebAudio interactive toy (dark `#040405`, white `#F4F4F6`, red `#E11D2E`, zero external CDNs) when a live interactive sandbox makes the concept click instantly.".into());
+    lines.push("  * `none`: Use ONLY when a visual/audio/interactive example truly adds zero clarity.".into());
+    lines.push("- For EACH distractor, provide `trapKind` ('confuses_concept' | 'misconception' | 'careless'), `trapTarget`, and `whyWrong` (1 crisp sentence explaining what picking THAT specific option would actually feel like or cause instead of the stated goal).".into());
+    lines.push("- `explanation`: 3 clear sentences bridging mechanics to real impact: (1) why you want this move emotionally/practically, (2) how the right answer achieves it, and (3) how the alternatives differ.".into());
     lines.push("- `angleSummary`: 4-8 words describing what angle this question tested.".into());
-    lines.push("Return ONLY valid JSON: {\"goal\":\"...\",\"prompt\":\"...\",\"correctAnswer\":\"...\",\"distractors\":[{\"text\":\"...\",\"trapKind\":\"misconception\",\"trapTarget\":\"short_hypothesis\",\"whyWrong\":\"...\"},{\"text\":\"...\",\"trapKind\":\"confuses_concept\",\"trapTarget\":\"other_concept_slug\",\"whyWrong\":\"...\"},{\"text\":\"...\",\"trapKind\":\"careless\",\"trapTarget\":\"surface_pattern\",\"whyWrong\":\"...\"}],\"explanation\":\"...\",\"angleSummary\":\"...\"}".into());
+    lines.push("Return ONLY valid JSON matching the schema.".into());
     lines.join("\n")
 }
 
@@ -1253,6 +1269,7 @@ fn demo_question(directive: &SchedulerDirective) -> Value {
     };
     json!({
         "goal": format!("Build a clear mental model of how \"{}\" serves real outcomes in {}.", directive.concept.title, directive.compressed_context.topic_title),
+        "primer": format!("Core idea: {}", directive.concept.summary),
         "hint": format!("Focus on the core purpose of \"{}\" rather than surface shortcuts.", directive.concept.title),
         "media": {
             "kind": "flow",

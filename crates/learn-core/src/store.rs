@@ -83,6 +83,7 @@ pub struct CreateQuestionParams {
     pub concept_id: String,
     pub intent: QuestionIntent,
     pub goal: String,
+    pub primer: String,
     pub hint: String,
     pub media: Option<ExampleMedia>,
     pub prompt: String,
@@ -205,6 +206,7 @@ impl KnowledgeStore {
                 concept_id TEXT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
                 intent TEXT NOT NULL,
                 goal TEXT NOT NULL DEFAULT '',
+                primer TEXT NOT NULL DEFAULT '',
                 hint TEXT NOT NULL DEFAULT '',
                 media_json TEXT NOT NULL DEFAULT '',
                 prompt TEXT NOT NULL,
@@ -242,6 +244,9 @@ impl KnowledgeStore {
         let _ = self
             .conn
             .execute("ALTER TABLE questions ADD COLUMN goal TEXT NOT NULL DEFAULT ''", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE questions ADD COLUMN primer TEXT NOT NULL DEFAULT ''", []);
         let _ = self
             .conn
             .execute("ALTER TABLE questions ADD COLUMN hint TEXT NOT NULL DEFAULT ''", []);
@@ -964,9 +969,9 @@ impl KnowledgeStore {
         self.conn.execute(
             r#"
             INSERT INTO questions (
-                id, topic_id, concept_id, intent, goal, hint, media_json, prompt, choices_json,
+                id, topic_id, concept_id, intent, goal, primer, hint, media_json, prompt, choices_json,
                 correct_choice_id, explanation, angle_summary, source, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             "#,
             params![
                 id,
@@ -974,6 +979,7 @@ impl KnowledgeStore {
                 input.concept_id,
                 input.intent.as_str(),
                 input.goal.trim(),
+                input.primer.trim(),
                 input.hint.trim(),
                 media_json,
                 input.prompt.trim(),
@@ -994,7 +1000,7 @@ impl KnowledgeStore {
             .query_row(
                 r#"
                 SELECT q.id, q.topic_id, q.concept_id, c.title, c.subtopic, c.depth,
-                       q.intent, q.goal, q.hint, q.media_json, q.prompt, q.choices_json,
+                       q.intent, q.goal, q.primer, q.hint, q.media_json, q.prompt, q.choices_json,
                        q.correct_choice_id, q.explanation, q.angle_summary, q.source,
                        q.created_at, q.answered_at, q.selected_choice_id, q.is_correct
                 FROM questions q
@@ -1013,7 +1019,7 @@ impl KnowledgeStore {
             .query_row(
                 r#"
                 SELECT q.id, q.topic_id, q.concept_id, c.title, c.subtopic, c.depth,
-                       q.intent, q.goal, q.hint, q.media_json, q.prompt, q.choices_json,
+                       q.intent, q.goal, q.primer, q.hint, q.media_json, q.prompt, q.choices_json,
                        q.correct_choice_id, q.explanation, q.angle_summary, q.source,
                        q.created_at, q.answered_at, q.selected_choice_id, q.is_correct
                 FROM questions q
@@ -1170,10 +1176,10 @@ impl KnowledgeStore {
 
     fn map_question(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredQuestion> {
         let intent_str: String = row.get(6)?;
-        let media_json: String = row.get(9)?;
-        let choices_json: String = row.get(11)?;
-        let source_str: String = row.get(15)?;
-        let is_correct_int: Option<i64> = row.get(19)?;
+        let media_json: String = row.get(10)?;
+        let choices_json: String = row.get(12)?;
+        let source_str: String = row.get(16)?;
+        let is_correct_int: Option<i64> = row.get(20)?;
         let media = if media_json.trim().is_empty() {
             None
         } else {
@@ -1188,17 +1194,18 @@ impl KnowledgeStore {
             depth: row.get(5)?,
             intent: QuestionIntent::from_str(&intent_str),
             goal: row.get(7)?,
-            hint: row.get(8)?,
+            primer: row.get(8)?,
+            hint: row.get(9)?,
             media,
-            prompt: row.get(10)?,
+            prompt: row.get(11)?,
             choices: serde_json::from_str(&choices_json).unwrap_or_default(),
-            correct_choice_id: row.get(12)?,
-            explanation: row.get(13)?,
-            angle_summary: row.get(14)?,
+            correct_choice_id: row.get(13)?,
+            explanation: row.get(14)?,
+            angle_summary: row.get(15)?,
             source: RunnerKind::from_str(&source_str),
-            created_at: row.get(16)?,
-            answered_at: row.get(17)?,
-            selected_choice_id: row.get(18)?,
+            created_at: row.get(17)?,
+            answered_at: row.get(18)?,
+            selected_choice_id: row.get(19)?,
             is_correct: is_correct_int.map(|v| v == 1),
         })
     }
@@ -1261,6 +1268,7 @@ mod tests {
                     concept_id: bc.id.clone(),
                     intent: QuestionIntent::Introduce,
                     goal: "Understand why Rust tracks borrows.".into(),
+                    primer: "Only one mutable reference can exist at a time so data never mutates underfoot.".into(),
                     hint: "Think about simultaneous writers.".into(),
                     media: None,
                     prompt: format!("Q {i}?"),

@@ -491,6 +491,9 @@ pub struct StoredQuestion {
     /// Plain-English framing of the goal/purpose before the question prompt.
     #[serde(default)]
     pub goal: String,
+    /// Optional 1-2 sentence teach-before-test key idea shown on new or low-mastery concepts.
+    #[serde(default)]
+    pub primer: String,
     /// Pre-generated 1-sentence hint revealed on demand (`H`) without spoiling the answer.
     #[serde(default)]
     pub hint: String,

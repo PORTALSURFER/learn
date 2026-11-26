@@ -67,6 +67,7 @@ pub struct LearnApp {
     // Audio preview playback & on-demand supporting example generation
     audio_child: Option<Child>,
     audio_status: Option<String>,
+    audio_showing_after: bool,
     media_busy: bool,
 
     // Live UI feedback
@@ -139,6 +140,7 @@ impl LearnApp {
             last_answer: None,
             audio_child: None,
             audio_status: None,
+            audio_showing_after: false,
             media_busy: false,
             busy_message: None,
             prefetching: false,
@@ -496,6 +498,7 @@ impl LearnApp {
             let _ = child.wait();
         }
         self.audio_status = None;
+        self.audio_showing_after = false;
     }
 
     fn generate_supporting_example(&mut self, cx: &mut Context<Self>) {
@@ -558,6 +561,7 @@ impl LearnApp {
             Ok(path) => match Command::new("afplay").arg(&path).spawn() {
                 Ok(child) => {
                     self.audio_child = Some(child);
+                    self.audio_showing_after = !dry_before;
                     self.audio_status = Some(format!("Playing: {label}"));
                     self.error_banner = None;
                 }
@@ -2559,18 +2563,27 @@ impl LearnApp {
                 let before_lbl = spec
                     .before_label
                     .clone()
-                    .unwrap_or_else(|| "Hear Starting Pattern".into());
+                    .unwrap_or_else(|| "Starting Loop".into());
                 let after_lbl = spec
                     .after_label
                     .clone()
-                    .unwrap_or_else(|| "Hear Target Effect".into());
+                    .unwrap_or_else(|| "Target Result".into());
                 let b_status = before_lbl.clone();
                 let a_status = after_lbl.clone();
-                let show_after_btn = self.last_answer.is_some()
-                    || !spec.after_step_levels.is_empty()
-                    || (spec.cutoff_end_hz - spec.cutoff_start_hz).abs() > 200.0
-                    || spec.nudge_ms.abs() > 1.0
-                    || spec.voice != "rim_click";
+                // Show Target Result button after answering so before-answer audio is crystal-clear & non-confusing
+                let show_after_btn = self.last_answer.is_some();
+
+                let displayed_levels: &[f32] =
+                    if self.audio_showing_after && !spec.after_step_levels.is_empty() {
+                        &spec.after_step_levels
+                    } else {
+                        &spec.step_levels
+                    };
+                let view_tag = if self.audio_showing_after && !spec.after_step_levels.is_empty() {
+                    format!("SHOWING: {after_lbl}")
+                } else {
+                    format!("SHOWING: {before_lbl}")
+                };
 
                 let mut card = div()
                     .w_full()
@@ -2596,8 +2609,8 @@ impl LearnApp {
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(theme::accent_text())
                                     .child(format!(
-                                        "AUDIO + VISUAL // {} ({:.0} BPM)",
-                                        title, spec.bpm
+                                        "AUDIO + VISUAL // {} ({:.0} BPM · {})",
+                                        title, spec.bpm, view_tag
                                     )),
                             )
                             .when_some(self.audio_status.clone(), |el, st| {
@@ -2610,26 +2623,43 @@ impl LearnApp {
                             }),
                     );
 
-                // Synced visual step bar grid inside the audio card so the learner SEES & HEARS it!
-                if !spec.step_levels.is_empty() {
+                // High-contrast, live-synced drum-machine step meter (tall bars + % readout + red peak highlight)
+                if !displayed_levels.is_empty() {
+                    let max_v = displayed_levels
+                        .iter()
+                        .copied()
+                        .fold(0.0f32, f32::max)
+                        .max(0.01);
+                    let min_v = displayed_levels
+                        .iter()
+                        .copied()
+                        .fold(1.0f32, f32::min);
+                    let has_contrast = (max_v - min_v) >= 0.12;
+
                     let mut bars = div()
                         .w_full()
-                        .h(px(68.0))
+                        .h(px(108.0))
                         .flex()
                         .items_end()
-                        .gap_1p5()
-                        .pt_1();
-                    for (i, val) in spec.step_levels.iter().enumerate() {
-                        let v = val.clamp(0.08, 1.0);
+                        .gap_2()
+                        .pt_2();
+                    for (i, val) in displayed_levels.iter().enumerate() {
+                        let raw_v = val.clamp(0.0, 1.0);
+                        // Scale bar height clearly between 10px and 72px so differences jump off the screen
+                        let scaled_h = (raw_v / max_v).clamp(0.14, 1.0) * 72.0;
+                        let is_peak = has_contrast && raw_v >= max_v - 0.05;
+                        let pct = (raw_v * 100.0).round() as u32;
                         let lbl = spec
                             .step_labels
                             .get(i)
                             .cloned()
                             .unwrap_or_else(|| format!("{}", i + 1));
+
                         bars = bars.child(
                             div()
                                 .flex_1()
-                                .min_w(px(12.0))
+                                .max_w(px(68.0))
+                                .min_w(px(18.0))
                                 .h_full()
                                 .flex()
                                 .flex_col()
@@ -2638,10 +2668,20 @@ impl LearnApp {
                                 .gap_1()
                                 .child(
                                     div()
+                                        .text_xs()
+                                        .text_color(if is_peak {
+                                            theme::accent_text()
+                                        } else {
+                                            theme::text_muted()
+                                        })
+                                        .child(format!("{pct}%")),
+                                )
+                                .child(
+                                    div()
                                         .w_full()
-                                        .h(px(46.0 * v))
+                                        .h(px(scaled_h))
                                         .rounded_t_xs()
-                                        .bg(if v >= 0.78 {
+                                        .bg(if is_peak {
                                             theme::accent()
                                         } else {
                                             theme::emerald()
@@ -2650,7 +2690,16 @@ impl LearnApp {
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(theme::text_muted())
+                                        .font_weight(if is_peak {
+                                            gpui::FontWeight::BOLD
+                                        } else {
+                                            gpui::FontWeight::NORMAL
+                                        })
+                                        .text_color(if is_peak {
+                                            theme::text_primary()
+                                        } else {
+                                            theme::text_muted()
+                                        })
                                         .child(lbl),
                                 ),
                         );
@@ -3078,6 +3127,38 @@ impl LearnApp {
                                 .line_height(px(18.0))
                                 .text_color(theme::text_secondary())
                                 .child(q.goal.clone()),
+                        ),
+                )
+            })
+            .when(!q.primer.trim().is_empty(), |el| {
+                el.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .px_3p5()
+                        .py_2p5()
+                        .rounded_xs()
+                        .bg(theme::emerald_soft())
+                        .border_l_2()
+                        .border_color(theme::emerald())
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme::emerald_text())
+                                .child("// KEY IDEA"),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .text_xs()
+                                .line_height(px(19.0))
+                                .text_color(theme::text_primary())
+                                .child(q.primer.clone()),
                         ),
                 )
             })
