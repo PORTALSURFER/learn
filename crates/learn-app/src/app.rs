@@ -1,4 +1,5 @@
 use std::process::{Child, Command};
+use std::time::Duration;
 
 use gpui::{
     AnyElement, AsyncApp, ClickEvent, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent,
@@ -75,6 +76,8 @@ pub struct LearnApp {
     clarify_input: TextBuffer,
     clarify_busy: bool,
     clarify_replies: Vec<ClarifyingReply>,
+    anim_tick: usize,
+    anim_running: bool,
     error_banner: Option<String>,
     info_banner: Option<String>,
 }
@@ -142,6 +145,8 @@ impl LearnApp {
             clarify_input: TextBuffer::new(),
             clarify_busy: false,
             clarify_replies: Vec::new(),
+            anim_tick: 0,
+            anim_running: false,
             error_banner: None,
             info_banner: None,
         };
@@ -248,6 +253,43 @@ impl LearnApp {
         }
     }
 
+    fn is_ai_active(&self) -> bool {
+        self.busy_message.is_some() || self.prefetching || self.clarify_busy
+    }
+
+    /// Runs a lightweight 120ms pulse timer ONLY while AI generation/prefetch/tutor is active.
+    /// Automatically exits as soon as all AI work completes (0% CPU when idle).
+    fn ensure_anim_loop(&mut self, cx: &mut Context<Self>) {
+        if self.anim_running || !self.is_ai_active() {
+            return;
+        }
+        self.anim_running = true;
+
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+
+                let mut keep_running = false;
+                let updated = this.update(cx, |view, cx| {
+                    if view.is_ai_active() {
+                        view.anim_tick = view.anim_tick.wrapping_add(1);
+                        keep_running = true;
+                        cx.notify();
+                    } else {
+                        view.anim_running = false;
+                    }
+                });
+
+                if updated.is_err() || !keep_running {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     // ---------- Async AI Operations (off UI thread!) ----------
 
     fn create_topic(&mut self, cx: &mut Context<Self>) {
@@ -271,6 +313,7 @@ impl LearnApp {
             user.runner.label(),
             title
         ));
+        self.ensure_anim_loop(cx);
         cx.notify();
 
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -344,6 +387,7 @@ impl LearnApp {
             "Preparing next tailored question via {}...",
             user.runner.label()
         ));
+        self.ensure_anim_loop(cx);
         cx.notify();
 
         let service = self.service.clone();
@@ -521,6 +565,7 @@ impl LearnApp {
         self.clarify_input.clear();
         self.active_field = ActiveField::None;
         self.error_banner = None;
+        self.ensure_anim_loop(cx);
         cx.notify();
 
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -583,6 +628,7 @@ impl LearnApp {
         let service = self.service.clone();
         self.prefetching = true;
         self.prefetch_topic_id = Some(topic_id.clone());
+        self.ensure_anim_loop(cx);
 
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut target_open = initial_target_open;
@@ -646,6 +692,7 @@ impl LearnApp {
             "Asking {} to deepen your Cognitive Mesh Knowledge Map...",
             user.runner.label()
         ));
+        self.ensure_anim_loop(cx);
         cx.notify();
 
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -1142,6 +1189,107 @@ impl LearnApp {
                         )
                     }),
             )
+    }
+
+    /// 3x3 sci-fi telemetry square matrix with a sweeping crimson + white pulse wave.
+    fn render_scifi_pulse_grid(&self) -> AnyElement {
+        // Spiral traversal order across the 3x3 matrix for a sleek radar/compute feel
+        const ORDER: [[usize; 3]; 3] = [
+            [0, 1, 2],
+            [7, 8, 3],
+            [6, 5, 4],
+        ];
+        let head = self.anim_tick % 9;
+        let mut grid = div()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            .p(px(4.0))
+            .rounded_xs()
+            .bg(theme::bg_input())
+            .border_1()
+            .border_color(theme::border_subtle());
+
+        for row_idx in 0..3 {
+            let mut row = div().flex().gap(px(3.0));
+            for col_idx in 0..3 {
+                let pos = ORDER[row_idx][col_idx];
+                let dist = (head + 9 - pos) % 9;
+                let color = match dist {
+                    0 => theme::accent_hover(), // Hot laser red head
+                    1 => theme::pure_white(),   // Crisp white spark
+                    2 => theme::accent(),       // Deep crimson trail
+                    3 => theme::text_muted(),   // Fading titanium grey
+                    _ => theme::border_subtle(),
+                };
+                row = row.child(div().size(px(6.0)).rounded(px(1.0)).bg(color));
+            }
+            grid = grid.child(row);
+        }
+
+        grid.into_any_element()
+    }
+
+    /// Compact 4-square horizontal scanner for inline status pills (buffer refill / Ask Tutor).
+    fn render_scifi_mini_scanner(&self) -> AnyElement {
+        const BOUNCE: [usize; 6] = [0, 1, 2, 3, 2, 1];
+        let active = BOUNCE[self.anim_tick % BOUNCE.len()];
+        let prev = BOUNCE[(self.anim_tick + BOUNCE.len() - 1) % BOUNCE.len()];
+
+        let mut strip = div().flex().items_center().gap(px(3.0)).flex_shrink_0();
+        for i in 0..4 {
+            let color = if i == active {
+                theme::accent_hover()
+            } else if i == prev {
+                theme::pure_white()
+            } else {
+                theme::border_subtle()
+            };
+            strip = strip.child(div().size(px(5.0)).rounded(px(1.0)).bg(color));
+        }
+        strip.into_any_element()
+    }
+
+    fn render_busy_panel(&self, msg: &str, subtitle: &str) -> AnyElement {
+        div()
+            .w_full()
+            .min_w_0()
+            .p_5()
+            .rounded_md()
+            .bg(theme::bg_card())
+            .border_1()
+            .border_color(theme::accent())
+            .flex()
+            .items_center()
+            .gap_4()
+            .child(self.render_scifi_pulse_grid())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(msg.to_string()),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(theme::text_muted())
+                            .child(subtitle.to_string()),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_banner(&self) -> Option<AnyElement> {
@@ -1797,20 +1945,10 @@ impl LearnApp {
         }
 
         if let Some(msg) = &self.busy_message {
-            container = container.child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .px_4()
-                    .py_3()
-                    .rounded_md()
-                    .bg(theme::accent_soft())
-                    .border_1()
-                    .border_color(theme::accent())
-                    .text_sm()
-                    .text_color(theme::accent_text())
-                    .child(msg.clone()),
-            );
+            container = container.child(self.render_busy_panel(
+                msg,
+                "SYNTHESIZING // Running off-thread so the interface stays responsive.",
+            ));
         }
 
         container = container.child(
@@ -2644,13 +2782,28 @@ impl LearnApp {
                                         } else {
                                             theme::accent_soft()
                                         })
-                                        .text_xs()
-                                        .text_color(if buffer_full {
-                                            theme::emerald_text()
+                                        .border_1()
+                                        .border_color(if buffer_full {
+                                            theme::border_subtle()
                                         } else {
-                                            theme::accent_text()
+                                            theme::accent()
                                         })
-                                        .child(buffer_label),
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .when(self.prefetching && !buffer_full, |el| {
+                                            el.child(self.render_scifi_mini_scanner())
+                                        })
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(if buffer_full {
+                                                    theme::emerald_text()
+                                                } else {
+                                                    theme::accent_text()
+                                                })
+                                                .child(buffer_label),
+                                        ),
                                 ),
                         ),
                 )
@@ -2678,36 +2831,10 @@ impl LearnApp {
         );
 
         if let Some(msg) = &self.busy_message {
-            return container.child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .p_8()
-                    .rounded_md()
-                    .bg(theme::bg_card())
-                    .border_1()
-                    .border_color(theme::accent())
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .text_base()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme::accent_text())
-                            .child(msg.clone()),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .text_xs()
-                            .text_color(theme::text_secondary())
-                            .child("Running live on a background worker so the UI stays responsive."),
-                    ),
-            );
+            return container.child(self.render_busy_panel(
+                msg,
+                "PROCESSING // Compiling Cognitive Slice and generating adaptive prompt.",
+            ));
         }
 
         let Some(q) = &self.current_question else {
@@ -3325,9 +3452,22 @@ impl LearnApp {
                 div()
                     .w_full()
                     .min_w_0()
-                    .text_xs()
-                    .text_color(theme::accent_text())
-                    .child("Asking tutor & updating your Cognitive Mesh..."),
+                    .px_3()
+                    .py_2()
+                    .rounded_sm()
+                    .bg(theme::bg_input())
+                    .border_1()
+                    .border_color(theme::accent())
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .child(self.render_scifi_mini_scanner())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::accent_text())
+                            .child("QUERYING TUTOR // Updating Cognitive Mesh..."),
+                    ),
             );
         }
 
@@ -3391,20 +3531,10 @@ impl LearnApp {
         }
 
         if let Some(msg) = &self.busy_message {
-            container = container.child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .px_4()
-                    .py_3()
-                    .rounded_md()
-                    .bg(theme::accent_soft())
-                    .border_1()
-                    .border_color(theme::accent())
-                    .text_sm()
-                    .text_color(theme::accent_text())
-                    .child(msg.clone()),
-            );
+            container = container.child(self.render_busy_panel(
+                msg,
+                "SYNTHESIZING // Running off-thread so the interface stays responsive.",
+            ));
         }
 
         let Some(map) = &self.knowledge_map else {
